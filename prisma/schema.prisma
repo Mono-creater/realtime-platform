@@ -1,0 +1,35 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "mysql"
+  url      = env("DATABASE_URL")
+}
+
+model WarningHistory {
+  id        Int      @id @default(autoincrement())
+  code      String
+  content   String
+  time      DateTime
+  worker    String?
+  remark    String?
+  createdAt DateTime @default(now()) @map("created_at")
+  @@map("warning_history")
+}
+
+model OverLimitSnapshot {
+  id           Int      @id @default(autoincrement())
+  title        String
+  count        Int
+  snapshotTime DateTime @map("snapshot_time")
+  @@map("over_limit_snapshot")
+}
+
+model User {
+  id       Int    @id @default(autoincrement())
+  username String @unique
+  password String
+  role     String @default("viewer")
+  @@map("users")
+}
