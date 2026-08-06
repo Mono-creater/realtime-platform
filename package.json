@@ -2,8 +2,8 @@
   "name": "vue-first",
   "version": "0.0.0",
   "private": true,
-  "type": "module",
   "scripts": {
+    "start": "node server.js",
     "dev": "vite",
     "build": "vite build",
     "preview": "vite preview",
@@ -12,18 +12,38 @@
     "lint:eslint": "eslint . --fix --cache",
     "format": "oxfmt src/"
   },
-  "dependencies": {
-    "@element-plus/icons-vue": "^2.3.2",
-    "@kjgl77/datav-vue3": "^1.7.4",
-    "axios": "^1.18.1",
-    "echarts": "^6.1.0",
-    "element-plus": "^2.14.2",
-    "express": "^5.2.1",
-    "pinia": "^3.0.4",
-    "socket.io-client": "^4.8.3",
-    "vue": "^3.5.32",
-    "vue-router": "^5.0.4"
-  },
+
+"dependencies": {
+  "@element-plus/icons-vue": "^2.3.2",
+  "@kjg177/datav-vue3": "^1.7.4",
+  "@prisma/client": "^5.22.0",
+  "axios": "^1.18.1",
+  "cors": "^2.8.5",
+  "echarts": "^6.1.0",
+  "element-plus": "^2.14.2",
+  "express": "^4.18.2",
+  "pinia": "^3.0.4",
+  "socket.io": "^4.8.1",
+  "socket.io-client": "^4.8.3",
+  "vue": "^3.5.32",
+  "vue-router": "^5.0.4"
+},
+
+"dependencies": {
+  "@element-plus/icons-vue": "^2.3.2",
+  "@prisma/client": "^5.22.0",
+  "axios": "^1.18.1",
+  "cors": "^2.8.5",
+  "echarts": "^6.1.0",
+  "element-plus": "^2.14.2",
+  "express": "^4.18.2",
+  "pinia": "^3.0.4",
+  "socket.io": "^4.8.1",
+  "socket.io-client": "^4.8.3",
+  "vue": "^3.5.32",
+  "vue-router": "^5.0.4"
+},
+
   "devDependencies": {
     "@eslint/js": "^10.0.1",
     "@vitejs/plugin-vue": "^6.0.6",
