@@ -12,6 +12,13 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
+// ============================================================
+// 根路径响应（解决 Railway 404 问题）
+// ============================================================
+app.get('/', (req, res) => {
+  res.send('🚀 驭弓大师平台已启动！');
+});
+
 const server = http.createServer(app);
 const io = new Server(server, {
   cors: { origin: "*" },
