@@ -1,0 +1,5 @@
+[build]
+builder = "nodejs"
+
+[nodejs]
+version = "22"
