@@ -1,5 +1,6 @@
 [build]
 builder = "nodejs"
+buildCommand = "npm install"
 
 [nodejs]
 version = "22"
