@@ -1,7 +1,6 @@
 const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
-const { PrismaClient } = require('@prisma/client');
 const cors = require('cors');
 const ModbusRTU = require('modbus-serial');
 const multer = require('multer');
@@ -13,12 +12,36 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
+// ============================================================
+// 根路径响应
+// ============================================================
+app.get('/', (req, res) => {
+  res.send('🚀 驭弓大师平台已启动！');
+});
+
 const server = http.createServer(app);
 const io = new Server(server, {
   cors: { origin: "*" },
 });
 
-const prisma = new PrismaClient();
+// ============================================================
+// 检查是否为模拟模式
+// ============================================================
+const isSimulation = process.env.PLC_MODE === 'simulation';
+
+// 条件加载 Prisma
+let prisma = null;
+if (!isSimulation) {
+  try {
+    const { PrismaClient } = require('@prisma/client');
+    prisma = new PrismaClient();
+    console.log('✅ Prisma Client 已初始化');
+  } catch (e) {
+    console.warn('⚠️ Prisma 加载失败，将以无数据库模式运行');
+  }
+} else {
+  console.log('🔄 模拟模式已启用，跳过数据库连接');
+}
 
 // ============================================================
 // 1. 原有业务逻辑（告警管理）
@@ -61,6 +84,10 @@ function broadcastFullUpdate() {
 }
 
 async function loadHistoryFromDB() {
+  if (!prisma) {
+    console.log('ℹ️ 跳过数据库加载（模拟模式），使用内存数据');
+    return;
+  }
   try {
     const history = await prisma.warningHistory.findMany({
       orderBy: { time: 'desc' },
@@ -90,6 +117,10 @@ async function loadHistoryFromDB() {
 }
 
 async function saveWarningToHistory(warning) {
+  if (!prisma) {
+    console.log('💾 模拟模式：保存警告到内存（不持久化）', warning);
+    return { id: Date.now() };
+  }
   const created = await prisma.warningHistory.create({
     data: {
       code: warning.code,
@@ -145,17 +176,27 @@ io.on('connection', (socket) => {
 
 // ---------- HTTP API ----------
 app.get('/api/test', async (req, res) => {
+  if (!prisma) {
+    return res.json({ count: currentWarningList.length });
+  }
   const count = await prisma.warningHistory.count();
   res.json({ count });
 });
 
 app.get('/api/stats/summary', async (req, res) => {
   try {
-    const total = await prisma.warningHistory.count();
-    const today = new Date().toISOString().slice(0,10);
-    const todayCount = await prisma.warningHistory.count({
-      where: { time: { gte: new Date(today), lt: new Date(today + 'T23:59:59') } }
-    });
+    let total, todayCount;
+    if (prisma) {
+      total = await prisma.warningHistory.count();
+      const today = new Date().toISOString().slice(0,10);
+      todayCount = await prisma.warningHistory.count({
+        where: { time: { gte: new Date(today), lt: new Date(today + 'T23:59:59') } }
+      });
+    } else {
+      total = currentWarningList.length;
+      const today = new Date().toISOString().slice(0,10);
+      todayCount = currentWarningList.filter(item => item.time && item.time.startsWith(today)).length;
+    }
     let health;
     if (total === 0) {
       health = 100;
@@ -178,6 +219,21 @@ app.get('/api/stats/trend', async (req, res) => {
   const days = parseInt(req.query.days) || 7;
   const startDate = new Date();
   startDate.setDate(startDate.getDate() - days);
+
+  if (!prisma) {
+    const dates = [];
+    const counts = [];
+    for (let i = days-1; i >= 0; i--) {
+      const d = new Date();
+      d.setDate(d.getDate() - i);
+      const dateStr = d.toISOString().slice(0,10);
+      dates.push(dateStr.slice(5));
+      const count = currentWarningList.filter(item => item.time && item.time.startsWith(dateStr)).length;
+      counts.push(count);
+    }
+    return res.json({ dates, counts });
+  }
+
   try {
     const results = await prisma.$queryRaw`
       SELECT DATE(time) as date, COUNT(*) as count
@@ -195,6 +251,14 @@ app.get('/api/stats/trend', async (req, res) => {
 });
 
 app.get('/api/stats/distribution', async (req, res) => {
+  if (!prisma) {
+    const counts = {};
+    currentWarningList.forEach(item => {
+      counts[item.content] = (counts[item.content] || 0) + 1;
+    });
+    const data = Object.keys(counts).map(name => ({ name, value: counts[name] }));
+    return res.json(data);
+  }
   try {
     const results = await prisma.$queryRaw`
       SELECT content, COUNT(*) as count
@@ -217,6 +281,16 @@ app.get('/api/history', async (req, res) => {
     if (start) where.time.gte = new Date(start);
     if (end) where.time.lte = new Date(end);
   }
+
+  if (!prisma) {
+    let list = [...currentWarningList];
+    if (content) list = list.filter(item => item.content === content);
+    if (start) list = list.filter(item => item.time >= start);
+    if (end) list = list.filter(item => item.time <= end);
+    list.sort((a, b) => new Date(b.time) - new Date(a.time));
+    return res.json(list);
+  }
+
   try {
     const history = await prisma.warningHistory.findMany({
       where,
@@ -255,7 +329,12 @@ app.post('/api/alert', async (req, res) => {
       videoUrl: videoUrl || ''
     };
 
-    const created = await prisma.warningHistory.create({ data });
+    let created;
+    if (prisma) {
+      created = await prisma.warningHistory.create({ data });
+    } else {
+      created = { id: Date.now() };
+    }
 
     const newWarning = {
       id: created.id,
@@ -300,6 +379,15 @@ app.get('/api/warning/:id', async (req, res) => {
   if (isNaN(numericId)) {
     return res.status(400).json({ error: '无效的ID' });
   }
+
+  if (!prisma) {
+    const warning = currentWarningList.find(w => w.id === numericId);
+    if (!warning) {
+      return res.status(404).json({ error: '记录不存在' });
+    }
+    return res.json(warning);
+  }
+
   try {
     const warning = await prisma.warningHistory.findUnique({
       where: { id: numericId }
@@ -336,16 +424,18 @@ app.delete('/api/warning/:id', async (req, res) => {
       console.warn(`⚠️ 内存中未找到 ID ${numericId}`);
     }
 
-    try {
-      await prisma.warningHistory.delete({
-        where: { id: numericId },
-      });
-      console.log(`✅ 数据库删除成功, ID: ${numericId}`);
-    } catch (dbErr) {
-      if (dbErr.code === 'P2025') {
-        console.log(`ℹ️ 数据库中不存在 ID ${numericId}，跳过数据库删除`);
-      } else {
-        throw dbErr;
+    if (prisma) {
+      try {
+        await prisma.warningHistory.delete({
+          where: { id: numericId },
+        });
+        console.log(`✅ 数据库删除成功, ID: ${numericId}`);
+      } catch (dbErr) {
+        if (dbErr.code === 'P2025') {
+          console.log(`ℹ️ 数据库中不存在 ID ${numericId}，跳过数据库删除`);
+        } else {
+          throw dbErr;
+        }
       }
     }
 
@@ -368,17 +458,14 @@ app.delete('/api/warning/:id', async (req, res) => {
 });
 
 // ============================================================
-// 2. 文件上传模块（保存到 D:/uploads）
+// 2. 文件上传模块
 // ============================================================
-
-// 修改上传目录为 D:/uploads
-const uploadDir = 'D:/uploads';
+const uploadDir = path.join(__dirname, 'uploads');
 if (!fs.existsSync(uploadDir)) {
     fs.mkdirSync(uploadDir, { recursive: true });
     console.log(`📁 已创建上传目录: ${uploadDir}`);
 }
 
-// 配置 multer 存储
 const storage = multer.diskStorage({
     destination: (req, file, cb) => {
         cb(null, uploadDir);
@@ -392,27 +479,22 @@ const storage = multer.diskStorage({
 
 const upload = multer({
     storage,
-    limits: { fileSize: 50 * 1024 * 1024 } // 限制 50MB
+    limits: { fileSize: 50 * 1024 * 1024 }
 });
 
-// 上传文件（图片/视频）
 app.post('/api/upload', upload.single('file'), (req, res) => {
     if (!req.file) {
         return res.status(400).json({ error: '未上传文件' });
     }
-    // 返回可访问的 URL（注意：URL 路径仍以 /uploads 开头，但实际文件在 D:/uploads）
     const url = `/uploads/${req.file.filename}`;
     res.json({ url });
 });
 
-// 提供静态文件服务（让前端能访问 D:/uploads 中的文件）
 app.use('/uploads', express.static(uploadDir));
 
 // ============================================================
 // 3. 数据采集模块（支持真实PLC和模拟模式）
 // ============================================================
-
-// ---------- 配置（支持环境变量） ----------
 const PLC_CONFIG = {
     host: process.env.PLC_HOST || '192.168.1.88',
     port: parseInt(process.env.PLC_PORT) || 502,
@@ -432,14 +514,11 @@ let sensorBuffer = [];
 let isPLCConnecting = false;
 let realInterval = null;
 let simulationInterval = null;
-
-// ===== 暂停模拟状态 =====
 let isSimulationPaused = false;
 
 // ---------- 故障分析逻辑 ----------
 function analyzeFault(data) {
     const faults = [];
-
     if (data.temperature > 80) {
         faults.push({
             type: '高温预警',
@@ -455,7 +534,6 @@ function analyzeFault(data) {
             detail: `均值温度 ${data.temperature}°C < -10°C`
         });
     }
-
     if (data.pressure > 1000) {
         faults.push({
             type: '高压报警',
@@ -471,7 +549,6 @@ function analyzeFault(data) {
             detail: `均值压力 ${data.pressure}kPa < 100kPa`
         });
     }
-
     if (data.humidity > 85) {
         faults.push({
             type: '高湿预警',
@@ -480,11 +557,9 @@ function analyzeFault(data) {
             detail: `均值湿度 ${data.humidity}% > 85%`
         });
     }
-
     return faults;
 }
 
-// ---------- 广播传感器数据 ----------
 function broadcastSensorData(avg, faults) {
     const payload = {
         timestamp: new Date().toISOString(),
@@ -498,7 +573,6 @@ function broadcastSensorData(avg, faults) {
     return payload;
 }
 
-// ---------- 处理告警存储 ----------
 async function handleAlarm(faults, avg) {
     for (const fault of faults) {
         const warning = {
@@ -533,7 +607,7 @@ async function handleAlarm(faults, avg) {
     broadcastFullUpdate();
 }
 
-// ---------- 真实 PLC 采集逻辑 ----------
+// ---------- 真实PLC采集 ----------
 async function connectPLC() {
     if (isPLCConnecting) return null;
     isPLCConnecting = true;
@@ -615,7 +689,6 @@ async function processBuffer() {
     sensorBuffer = [];
 }
 
-// ---------- 模拟模式（支持暂停） ----------
 function startSimulation() {
     if (simulationInterval) return;
     if (realInterval) {
@@ -625,7 +698,6 @@ function startSimulation() {
     console.log('🔄 模拟模式已启动，将生成随机传感器数据');
     simulationInterval = setInterval(() => {
         if (isSimulationPaused) return;
-        // 生成随机数据
         let temp = Math.round((20 + Math.random() * 70) * 10) / 10;
         let pressure = Math.round((50 + Math.random() * 1150) * 100) / 100;
         let humidity = Math.round((20 + Math.random() * 75) * 10) / 10;
@@ -653,7 +725,6 @@ function startSimulation() {
     }, PLC_CONFIG.readInterval);
 }
 
-// ---------- 启动真实采集 ----------
 async function startRealCollection() {
     if (simulationInterval) {
         clearInterval(simulationInterval);
@@ -673,7 +744,7 @@ async function startRealCollection() {
     }
 }
 
-// ---------- API 接口：查询和切换模式 ----------
+// ---------- API：查询和切换模式 ----------
 app.get('/api/plc/mode', (req, res) => {
     res.json({ mode: SIMULATION_MODE ? 'simulation' : 'real' });
 });
@@ -709,7 +780,6 @@ app.post('/api/plc/mode', async (req, res) => {
     res.json({ mode: mode, message: `已切换到 ${mode} 模式` });
 });
 
-// ===== 暂停模拟 API =====
 app.get('/api/simulation/pause', (req, res) => {
     res.json({ paused: isSimulationPaused });
 });
@@ -725,11 +795,6 @@ app.post('/api/simulation/pause', (req, res) => {
 // ============================================================
 app.delete('/api/simulation/clear', async (req, res) => {
     try {
-        const deleted = await prisma.warningHistory.deleteMany({
-            where: {
-                code: 'PLC_SENSOR'
-            }
-        });
         const before = currentWarningList.length;
         currentWarningList = currentWarningList.filter(w => w.code !== 'PLC_SENSOR');
         const removed = before - currentWarningList.length;
@@ -742,8 +807,8 @@ app.delete('/api/simulation/clear', async (req, res) => {
         }));
 
         broadcastFullUpdate();
-        console.log(`🧹 已清除 ${deleted.count} 条模拟告警记录（内存移除 ${removed} 条）`);
-        res.json({ success: true, dbCount: deleted.count, memRemoved: removed });
+        console.log(`🧹 已清除 ${removed} 条模拟告警记录`);
+        res.json({ success: true, memRemoved: removed });
     } catch (err) {
         console.error('❌ 清除模拟数据失败:', err);
         res.status(500).json({ error: err.message });
@@ -753,7 +818,7 @@ app.delete('/api/simulation/clear', async (req, res) => {
 // ============================================================
 // 5. 启动服务器
 // ============================================================
-const PORT = process.env.PORT || 3000;
+const PORT = 3000; // 强制使用 3000
 (async () => {
     await loadHistoryFromDB();
     server.listen(PORT, () => {
