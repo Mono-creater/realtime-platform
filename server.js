@@ -13,10 +13,15 @@ app.use(cors());
 app.use(express.json());
 
 // ============================================================
-// 根路径响应
+// 托管前端静态文件（Vue 构建产物）
+// ============================================================
+app.use(express.static(path.join(__dirname, 'dist')));
+
+// ============================================================
+// 根路径响应（返回 index.html）
 // ============================================================
 app.get('/', (req, res) => {
-  res.send('🚀 驭弓大师平台已启动！');
+  res.sendFile(path.join(__dirname, 'dist', 'index.html'));
 });
 
 const server = http.createServer(app);
@@ -818,7 +823,7 @@ app.delete('/api/simulation/clear', async (req, res) => {
 // ============================================================
 // 5. 启动服务器
 // ============================================================
-const PORT = 3000; // 强制使用 3000
+const PORT = process.env.PORT || 3000;
 (async () => {
     await loadHistoryFromDB();
     server.listen(PORT, () => {
