@@ -818,7 +818,7 @@ app.delete('/api/simulation/clear', async (req, res) => {
 // ============================================================
 // 5. 启动服务器
 // ============================================================
-const PORT = 3000; // 强制使用 3000
+const PORT = process.env.PORT || 3000;// 强制使用 3000
 (async () => {
     await loadHistoryFromDB();
     server.listen(PORT, () => {
