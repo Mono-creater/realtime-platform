@@ -3,19 +3,31 @@
     <!-- 标题与搜索栏 -->
     <div class="overview-header">
       <span class="title">📋 实时故障总览</span>
-      <el-input
-        v-model="keyword"
-        placeholder="搜索车号/内容/编号..."
-        clearable
-        prefix-icon="Search"
-        size="default"
-        class="search-input"
-      />
+      <div class="header-actions">
+        <el-input
+          v-model="keyword"
+          placeholder="搜索车号/内容/编号..."
+          clearable
+          prefix-icon="Search"
+          size="default"
+          class="search-input"
+        />
+        <el-button
+          type="danger"
+          plain
+          size="default"
+          :disabled="selectedRows.length === 0"
+          @click="deleteSelected"
+        >
+          🗑️ 删除选中记录{{ selectedRows.length ? `（${selectedRows.length}）` : '' }}
+        </el-button>
+      </div>
     </div>
 
     <!-- 滚动表格容器 -->
     <div class="scroll-wrapper" ref="scrollWrapper">
       <el-table
+        ref="tableRef"
         :data="filteredData"
         border
         max-height="100%"
@@ -23,8 +35,10 @@
         class="scroll-table"
         style="width: 100%;"
         @row-click="handleRowClick"
+        @selection-change="handleSelectionChange"
         :row-class-name="rowClassName"
       >
+        <el-table-column type="selection" width="48" align="center" />
         <el-table-column label="序号" type="index" width="60" align="center" />
         <el-table-column prop="code" label="碳滑板编号" min-width="120" align="center" />
         <el-table-column prop="content" label="预警内容" min-width="100" align="center" />
@@ -68,12 +82,19 @@ import api from '@/utils/api'
 const allData = ref([])
 const keyword = ref('')
 const scrollWrapper = ref(null)
+const tableRef = ref(null)
 let scrollTimer = null
 const SCROLL_SPEED = 1.2
 const FRAME_INTERVAL = 30
 
-// 选中的行ID
+// 选中的行ID（点击高亮）
 const selectedRowId = ref(null)
+
+// 勾选删除的记录（多选）
+const selectedRows = ref([])
+function handleSelectionChange(rows) {
+  selectedRows.value = rows
+}
 
 // ---------- 过滤 ----------
 const filteredData = computed(() => {
@@ -91,6 +112,7 @@ const filteredData = computed(() => {
 async function fetchData() {
   try {
     const res = await api.get('/api/history')
+    tableRef.value?.clearSelection()
     allData.value = res.data.map(item => ({
       id: item.id,
       code: item.code,
@@ -121,6 +143,30 @@ function handleRowClick(row) {
 // 行类名动态绑定
 function rowClassName({ row }) {
   return row.id === selectedRowId.value ? 'selected-row' : ''
+}
+
+// ---------- 删除选中故障记录 ----------
+async function deleteSelected() {
+  if (selectedRows.value.length === 0) return
+  try {
+    await ElMessageBox.confirm(
+      `确定删除选中的 ${selectedRows.value.length} 条故障记录？删除后不可恢复。`,
+      '删除确认',
+      { type: 'warning', confirmButtonText: '删除', cancelButtonText: '取消' }
+    )
+  } catch {
+    return // 用户取消
+  }
+  try {
+    const ids = selectedRows.value.map(r => r.id)
+    const res = await api.delete('/api/warnings', { data: { ids } })
+    ElMessage.success(`已删除 ${res.data.deleted} 条记录`)
+    tableRef.value?.clearSelection()
+    await fetchData()
+  } catch (err) {
+    ElMessage.error('删除失败：' + (err.response?.data?.error || err.message))
+    console.error(err)
+  }
 }
 
 // ---------- 导出指定故障 PDF ----------
@@ -222,6 +268,12 @@ onBeforeUnmount(() => {
   letter-spacing: 1px;
   color: #e0f0ff;
   text-shadow: 0 2px 4px rgba(0,0,0,0.3);
+}
+
+.header-actions {
+  display: flex;
+  align-items: center;
+  gap: 12px;
 }
 
 .search-input {

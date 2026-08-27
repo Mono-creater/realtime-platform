@@ -467,6 +467,44 @@ app.delete('/api/warning/:id', async (req, res) => {
   }
 });
 
+// 批量删除故障记录（故障总览勾选删除）
+app.delete('/api/warnings', async (req, res) => {
+  const { ids } = req.body || {};
+  if (!Array.isArray(ids) || ids.length === 0) {
+    return res.status(400).json({ error: 'ids 必须是非空数组' });
+  }
+  const numericIds = [...new Set(ids.map(Number).filter(n => Number.isFinite(n)))];
+  if (numericIds.length === 0) {
+    return res.status(400).json({ error: 'ids 中没有有效数字' });
+  }
+
+  // 内存列表同步删除（无数据库模式下的数据源）
+  const idSet = new Set(numericIds);
+  const before = currentWarningList.length;
+  currentWarningList = currentWarningList.filter(w => !idSet.has(Number(w.id)));
+  const deletedMem = before - currentWarningList.length;
+
+  // 数据库删除（deleteMany 对不存在的记录不报错）
+  let deletedDb = 0;
+  if (prisma) {
+    try {
+      const result = await prisma.warningHistory.deleteMany({
+        where: { id: { in: numericIds } },
+      });
+      deletedDb = result.count;
+    } catch (dbErr) {
+      console.error('❌ 批量删除数据库记录失败:', dbErr.message);
+      return res.status(500).json({ error: dbErr.message });
+    }
+  }
+
+  updateOverLimitStats();
+  broadcastFullUpdate();
+  const deleted = prisma ? deletedDb : deletedMem;
+  console.log(`🗑️ 批量删除故障记录: ${deleted} 条 (请求 ${numericIds.length} 条)`);
+  res.json({ deleted, ids: numericIds });
+});
+
 // ============================================================
 // 2. 文件上传模块
 // ============================================================
