@@ -81,13 +81,6 @@ onMounted(() => {
 </script>
 
 <style scoped>
-@font-face {
-  font-family: 'FZYTJW';
-  src: url('@/assets/fonts/FZYTJW.TTF') format('truetype');
-  font-weight: normal;
-  font-style: normal;
-}
-
 .pantograph {
   width: 100%;
   height: 100vh;

@@ -1,5 +1,5 @@
 <template>
-  <div class="monitor-global" v-loading="loading" element-loadting-text="加载数据中...">
+  <div class="monitor-global">
     <!-- ===== 统计卡片行 ===== -->
     <el-row :gutter="20" class="stat-row">
       <el-col :span="6" v-for="(item, idx) in statCards" :key="item.label">
@@ -81,9 +81,8 @@
 <script setup>
 import { ref, onMounted, onUnmounted, nextTick, computed } from 'vue'
 import { Van, Warning, CircleCheck, Monitor, Bell, Location, TrendCharts, PieChart } from '@element-plus/icons-vue'
-import * as echarts from 'echarts'
+import echarts from '@/utils/echarts'
 import axios from 'axios'
-import { ElMessage, ElMessageBox } from 'element-plus'
 import socket from '@/socket'
 
 // ---------- 常量 ----------
@@ -127,7 +126,6 @@ const MOCK_ALARMS = [
 ]
 
 // ---------- 状态 ----------
-const loading = ref(false)
 const statCards = ref([])
 // fullWarningList 存储所有告警（用于健康度计算），但显示时过滤
 const fullWarningList = ref([...MOCK_ALARMS])
@@ -357,15 +355,13 @@ function calculateTrendData(list) {
   }
 }
 
-function updateTrendChart() {
-  if (!trendChart) return
-  const data = calculateTrendData(fullWarningList.value)
-  const option = {
+function buildTrendOption(dates, counts) {
+  return {
     tooltip: { trigger: 'axis', backgroundColor: 'rgba(10,30,50,0.9)', borderColor: '#00c6ff', textStyle: { color: '#fff' } },
     grid: { left: '3%', right: '3%', bottom: '3%', top: '8%', containLabel: true },
     xAxis: {
       type: 'category',
-      data: data.dates,
+      data: dates,
       axisLine: { lineStyle: { color: '#2a4a6a' } },
       axisLabel: { color: '#b0c4de', fontSize: 12 }
     },
@@ -377,7 +373,7 @@ function updateTrendChart() {
     series: [{
       name: '告警数',
       type: 'line',
-      data: data.counts,
+      data: counts,
       smooth: true,
       symbol: 'circle',
       symbolSize: 8,
@@ -391,7 +387,22 @@ function updateTrendChart() {
       itemStyle: { color: '#00c6ff' }
     }]
   }
-  trendChart.setOption(option, true)
+}
+
+// 趋势图：优先使用后端 /api/stats/trend，失败时回退本地计算
+async function updateTrendChart() {
+  if (!trendChart) return
+  let dates, counts
+  try {
+    const res = await axios.get('/api/stats/trend', { params: { days: 7 } })
+    dates = res.data.dates
+    counts = res.data.counts
+  } catch {
+    const local = calculateTrendData(fullWarningList.value)
+    dates = local.dates
+    counts = local.counts
+  }
+  trendChart.setOption(buildTrendOption(dates, counts), true)
 }
 
 // ---------- 饼图（平滑更新） ----------
@@ -402,7 +413,15 @@ async function updatePieChart() {
     return
   }
 
-  const data = getDistributionFromList(filteredWarningList.value)
+  // 优先使用后端 /api/stats/distribution，失败时回退本地计算
+  let data
+  try {
+    const res = await axios.get('/api/stats/distribution')
+    const dist = Array.isArray(res.data) ? res.data.filter(d => ALARM_TYPES.includes(d.name)) : []
+    data = ALARM_TYPES.map(name => ({ name, value: (dist.find(d => d.name === name) || {}).value || 0 }))
+  } catch {
+    data = getDistributionFromList(filteredWarningList.value)
+  }
   const filteredData = data.filter(d => d.value > 0)
   const finalData = filteredData.length > 0 ? filteredData : [
     { name: '压力超限', value: 10 },
@@ -489,6 +508,8 @@ function handleResize() {
 }
 
 // ---------- 生命周期 ----------
+let statsTimer = null
+
 onMounted(async () => {
   await initTrendChart()
   await fetchHistory()
@@ -496,19 +517,15 @@ onMounted(async () => {
   await fetchStatistics()
   window.addEventListener('resize', handleResize)
 
-  const timer = setInterval(async () => {
+  statsTimer = setInterval(async () => {
     await fetchStatistics()
   }, 30000)
-  window.__globalTimer = timer
 })
 
 onUnmounted(() => {
   socket.off('fullUpdate', handleFullUpdate)
   window.removeEventListener('resize', handleResize)
-  if (window.__globalTimer) {
-    clearInterval(window.__globalTimer)
-    delete window.__globalTimer
-  }
+  if (statsTimer) clearInterval(statsTimer)
   trendChart?.dispose()
   pieChart?.dispose()
 })

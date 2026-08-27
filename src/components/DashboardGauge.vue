@@ -172,7 +172,7 @@ export default {
     }
   },
 
-  beforeDestroy() {
+  beforeUnmount() {
     // 组件销毁前停止动画
     this.stopAnimation()
   },
@@ -282,8 +282,7 @@ export default {
         blockWidth,
         themeConfig.primary,
         inactiveColor,
-        this.activeSegments,
-        this.glowIntensity
+        this.activeSegments
       )
       clearGlowEffect(ctx)
 

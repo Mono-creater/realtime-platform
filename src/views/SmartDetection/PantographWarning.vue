@@ -105,7 +105,7 @@
 <script setup>
 import { ref, onMounted } from 'vue';
 import { useRoute, useRouter } from 'vue-router';
-import axios from 'axios';
+import api from '@/utils/api';
 import { ArrowLeft } from '@element-plus/icons-vue';
 
 const route = useRoute();
@@ -150,7 +150,7 @@ onMounted(async () => {
     return;
   }
   try {
-    const res = await axios.get(`/api/warning/${id}`);
+    const res = await api.get(`/api/warning/${id}`);
     detail.value = res.data;
   } catch (err) {
     console.error('加载详情失败', err);

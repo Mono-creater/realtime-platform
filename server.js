@@ -7,6 +7,16 @@ const multer = require('multer');
 const { v4: uuidv4 } = require('uuid');
 const path = require('path');
 const fs = require('fs');
+const {
+    THRESHOLDS,
+    parseMainPacket,
+    parseSubPacket,
+    anomaliesFromBitmap
+} = require('./plc-packet');
+const { createControlEngine } = require('./control-engine');
+
+// 自动加载 .env（Node >= 20.19；通过 --env-file 启动时已有变量不会被覆盖）
+try { process.loadEnvFile(); } catch { /* 无 .env 文件时忽略 */ }
 
 const app = express();
 app.use(cors());
@@ -32,16 +42,17 @@ const io = new Server(server, {
 // ============================================================
 // 检查是否为模拟模式
 // ============================================================
-const isSimulation = process.env.PLC_MODE === 'simulation';
+// 运行时模式标志（运行中可能因 PLC 断连自动回退到模拟模式）
+let SIMULATION_MODE = process.env.PLC_MODE === 'simulation';
 
 // 条件加载 Prisma
 let prisma = null;
-if (!isSimulation) {
+if (!SIMULATION_MODE) {
   try {
     const { PrismaClient } = require('@prisma/client');
     prisma = new PrismaClient();
     console.log('✅ Prisma Client 已初始化');
-  } catch (e) {
+  } catch {
     console.warn('⚠️ Prisma 加载失败，将以无数据库模式运行');
   }
 } else {
@@ -51,33 +62,20 @@ if (!isSimulation) {
 // ============================================================
 // 1. 原有业务逻辑（告警管理）
 // ============================================================
-let currentWarningList = [
-  { id: 1, code: '451698205212', content: '压力超限', time: '2024-12-15', worker: 'WX-0365', remark: '/' },
-  { id: 2, code: '451698205238', content: '压力超限', time: '2024-12-07', worker: 'WX-0358', remark: '/' },
-  { id: 3, code: '788020547496', content: '导高超限', time: '2024-11-23', worker: 'WX-0322', remark: '/' },
-  { id: 4, code: '451698205289', content: '压力超限', time: '2024-11-20', worker: 'WX-0347', remark: '/' },
-  { id: 5, code: '788020547466', content: '导高超限', time: '2024-10-31', worker: 'WX-0327', remark: '/' },
-  { id: 6, code: '788020547474', content: '燃弧超限', time: '2024-10-20', worker: 'WX-0389', remark: '/' },
-];
+// 2026-08-27 起清除内置模拟数据（原 6 条 2024 演示记录及饼图/统计初值）：
+// 告警历史从空开始，真实数据由 PLC 告警或数据库加载（loadHistoryFromDB）提供
+let currentWarningList = [];
 
 let currentOverLimit = [
-  { title: '压力超限', count: 4 },
-  { title: '导高超限', count: 1 },
-  { title: '燃弧超限', count: 1 },
+  { title: '压力超限', count: 0 },
+  { title: '导高超限', count: 0 },
+  { title: '燃弧超限', count: 0 },
   { title: '拉出值超限', count: 0 },
 ];
 
 let currentPieData = {
-  first: [
-    { name: '压力超限', value: 66, color: '#2ca7e0' },
-    { name: '导高超限', value: 17, color: '#1b8edb' },
-    { name: '拉出值超限', value: 17, color: '#0e6fb7' },
-  ],
-  second: [
-    { name: '压力超限', value: 56, color: '#2ca7e0' },
-    { name: '导高超限', value: 27, color: '#1b8edb' },
-    { name: '拉出值超限', value: 17, color: '#0e6fb7' },
-  ]
+  first: [],
+  second: []
 };
 
 function broadcastFullUpdate() {
@@ -88,6 +86,30 @@ function broadcastFullUpdate() {
   });
 }
 
+// ============================================================
+// 内存告警列表公共操作（封顶 + 统计 + 唯一 ID）
+// ============================================================
+const MAX_MEMORY_WARNINGS = 500;
+
+function updateOverLimitStats() {
+  const counts = {};
+  currentWarningList.forEach(w => { counts[w.content] = (counts[w.content] || 0) + 1; });
+  currentOverLimit = currentOverLimit.map(card => ({
+    ...card,
+    count: counts[card.title] || 0,
+  }));
+}
+
+function pushWarning(warning) {
+  currentWarningList.push(warning);
+  if (currentWarningList.length > MAX_MEMORY_WARNINGS) {
+    currentWarningList.splice(0, currentWarningList.length - MAX_MEMORY_WARNINGS);
+  }
+}
+
+let memIdCounter = Date.now();
+function nextMemId() { return ++memIdCounter; }
+
 async function loadHistoryFromDB() {
   if (!prisma) {
     console.log('ℹ️ 跳过数据库加载（模拟模式），使用内存数据');
@@ -96,6 +118,7 @@ async function loadHistoryFromDB() {
   try {
     const history = await prisma.warningHistory.findMany({
       orderBy: { time: 'desc' },
+      take: MAX_MEMORY_WARNINGS,
     });
     if (history.length > 0) {
       currentWarningList = history.map(item => ({
@@ -107,14 +130,9 @@ async function loadHistoryFromDB() {
         remark: item.remark || '/',
       }));
     } else {
-      console.log('⚠️ 数据库为空，使用内存模拟数据');
+      console.log('ℹ️ 数据库为空，告警历史从空开始');
     }
-    const counts = {};
-    currentWarningList.forEach(w => { counts[w.content] = (counts[w.content] || 0) + 1; });
-    currentOverLimit = currentOverLimit.map(card => ({
-      ...card,
-      count: counts[card.title] || 0,
-    }));
+    updateOverLimitStats();
     console.log(`✅ 当前加载 ${currentWarningList.length} 条记录`);
   } catch (err) {
     console.error('❌ 加载历史数据失败，使用内存默认数据:', err);
@@ -124,7 +142,7 @@ async function loadHistoryFromDB() {
 async function saveWarningToHistory(warning) {
   if (!prisma) {
     console.log('💾 模拟模式：保存警告到内存（不持久化）', warning);
-    return { id: Date.now() };
+    return { id: nextMemId() };
   }
   const created = await prisma.warningHistory.create({
     data: {
@@ -140,8 +158,6 @@ async function saveWarningToHistory(warning) {
 
 // ---------- WebSocket 事件 ----------
 io.on('connection', (socket) => {
-  console.log('新设备连接:', socket.id);
-
   socket.emit('fullUpdate', {
     warningList: currentWarningList,
     overLimit: currentOverLimit,
@@ -149,33 +165,32 @@ io.on('connection', (socket) => {
   });
 
   socket.on('addWarning', async (newWarning) => {
-    const created = await saveWarningToHistory(newWarning);
-    const memWarning = {
-      id: created.id,
-      code: newWarning.code,
-      content: newWarning.content,
-      time: newWarning.time,
-      worker: newWarning.worker || '',
-      remark: newWarning.remark || '/',
-    };
-    currentWarningList.push(memWarning);
-
-    const counts = {};
-    currentWarningList.forEach(w => { counts[w.content] = (counts[w.content] || 0) + 1; });
-    currentOverLimit = currentOverLimit.map(card => ({
-      ...card,
-      count: counts[card.title] || 0,
-    }));
-    broadcastFullUpdate();
+    try {
+      if (!newWarning || typeof newWarning !== 'object' || Array.isArray(newWarning)) return;
+      const created = await saveWarningToHistory(newWarning);
+      const memWarning = {
+        id: created.id,
+        code: newWarning.code,
+        content: newWarning.content,
+        time: newWarning.time,
+        worker: newWarning.worker || '',
+        remark: newWarning.remark || '/',
+      };
+      pushWarning(memWarning);
+      updateOverLimitStats();
+      broadcastFullUpdate();
+    } catch (err) {
+      console.error('❌ addWarning 处理失败:', err.message);
+    }
   });
 
   socket.on('updatePie', (data) => {
-    currentPieData[data.tab] = data.data;
+    if (!data || typeof data !== 'object' || Array.isArray(data)) return;
+    const tab = data.tab;
+    if (typeof tab !== 'string' || ['__proto__', 'constructor', 'prototype'].includes(tab)) return;
+    if (!data.data || typeof data.data !== 'object' || Array.isArray(data.data)) return;
+    currentPieData[tab] = data.data;
     broadcastFullUpdate();
-  });
-
-  socket.on('disconnect', () => {
-    console.log('设备断开:', socket.id);
   });
 });
 
@@ -190,23 +205,21 @@ app.get('/api/test', async (req, res) => {
 
 app.get('/api/stats/summary', async (req, res) => {
   try {
-    let total, todayCount;
+    let todayCount;
     if (prisma) {
-      total = await prisma.warningHistory.count();
       const today = new Date().toISOString().slice(0,10);
       todayCount = await prisma.warningHistory.count({
         where: { time: { gte: new Date(today), lt: new Date(today + 'T23:59:59') } }
       });
     } else {
-      total = currentWarningList.length;
       const today = new Date().toISOString().slice(0,10);
       todayCount = currentWarningList.filter(item => item.time && item.time.startsWith(today)).length;
     }
     let health;
-    if (total === 0) {
+    if (todayCount === 0) {
       health = 100;
     } else {
-      health = Math.round(100 - total * 0.5);
+      health = Math.round(100 - todayCount * 0.5);
       health = Math.min(100, Math.max(0, health));
     }
     res.json({
@@ -279,6 +292,8 @@ app.get('/api/stats/distribution', async (req, res) => {
 
 app.get('/api/history', async (req, res) => {
   const { start, end, content } = req.query;
+  const rawLimit = parseInt(req.query.limit, 10);
+  const limit = Number.isFinite(rawLimit) ? Math.min(Math.max(rawLimit, 1), 2000) : 500;
   const where = {};
   if (content) where.content = content;
   if (start || end) {
@@ -293,13 +308,14 @@ app.get('/api/history', async (req, res) => {
     if (start) list = list.filter(item => item.time >= start);
     if (end) list = list.filter(item => item.time <= end);
     list.sort((a, b) => new Date(b.time) - new Date(a.time));
-    return res.json(list);
+    return res.json(list.slice(0, limit));
   }
 
   try {
     const history = await prisma.warningHistory.findMany({
       where,
       orderBy: { time: 'desc' },
+      take: limit,
     });
     res.json(history);
   } catch (err) {
@@ -310,15 +326,18 @@ app.get('/api/history', async (req, res) => {
 app.post('/api/alert', async (req, res) => {
   try {
     const {
-      cameraId, timestamp, alarmType, level, value, code, worker,
+      timestamp, alarmType, level, value, code, worker,
       carNumber, line, station, direction, location, mileage, speed,
       imageUrl, videoUrl
     } = req.body;
 
+    const parsedTime = timestamp ? new Date(timestamp) : new Date();
+    const time = isNaN(parsedTime.getTime()) ? new Date() : parsedTime;
+
     const data = {
       code: code || 'UNKNOWN',
       content: alarmType || '未知告警',
-      time: new Date(timestamp),
+      time,
       worker: worker || 'SYSTEM',
       remark: imageUrl || '',
       level: level || '--',
@@ -338,7 +357,7 @@ app.post('/api/alert', async (req, res) => {
     if (prisma) {
       created = await prisma.warningHistory.create({ data });
     } else {
-      created = { id: Date.now() };
+      created = { id: nextMemId() };
     }
 
     const newWarning = {
@@ -361,15 +380,8 @@ app.post('/api/alert', async (req, res) => {
       videoUrl: data.videoUrl
     };
 
-    currentWarningList.push(newWarning);
-
-    const counts = {};
-    currentWarningList.forEach(w => { counts[w.content] = (counts[w.content] || 0) + 1; });
-    currentOverLimit = currentOverLimit.map(card => ({
-      ...card,
-      count: counts[card.title] || 0,
-    }));
-
+    pushWarning(newWarning);
+    updateOverLimitStats();
     broadcastFullUpdate();
     res.json({ success: true, id: created.id });
   } catch (err) {
@@ -444,15 +456,8 @@ app.delete('/api/warning/:id', async (req, res) => {
       }
     }
 
-    const counts = {};
-    currentWarningList.forEach(w => { counts[w.content] = (counts[w.content] || 0) + 1; });
-    currentOverLimit = currentOverLimit.map(card => ({
-      ...card,
-      count: counts[card.title] || 0,
-    }));
-
+    updateOverLimitStats();
     broadcastFullUpdate();
-    console.log('📡 已广播更新');
 
     res.json({ success: true, message: '记录已删除' });
   } catch (err) {
@@ -495,6 +500,92 @@ app.post('/api/upload', upload.single('file'), (req, res) => {
     res.json({ url });
 });
 
+// ============================================================
+// PDF 导出：导出指定故障报告
+// ============================================================
+const PDFDocument = require('pdfkit');
+const PDF_FONT_PATH = path.join(__dirname, 'src', 'assets', 'fonts', 'FZYTJW.TTF');
+
+function formatPdfTime(t) {
+    if (typeof t !== 'string') return '--';
+    const d = new Date(t);
+    return isNaN(d.getTime()) ? t : d.toLocaleString('zh-CN', { hour12: false });
+}
+
+app.get('/api/export/pdf/:id', async (req, res) => {
+    const numericId = Number(req.params.id);
+    if (isNaN(numericId)) {
+        return res.status(400).json({ error: '无效的ID' });
+    }
+
+    // 查找故障记录（内存或数据库）
+    let warning;
+    if (prisma) {
+        try {
+            warning = await prisma.warningHistory.findUnique({ where: { id: numericId } });
+        } catch (err) {
+            return res.status(500).json({ error: err.message });
+        }
+        if (warning) {
+            warning = { ...warning, time: warning.time.toISOString().slice(0, 10) };
+        }
+    } else {
+        warning = currentWarningList.find(w => Number(w.id) === numericId);
+    }
+    if (!warning) {
+        return res.status(404).json({ error: '记录不存在' });
+    }
+
+    try {
+        const doc = new PDFDocument({ size: 'A4', margins: { top: 40, bottom: 40, left: 50, right: 50 } });
+        res.setHeader('Content-Type', 'application/pdf');
+        res.setHeader('Content-Disposition', `attachment; filename="fault-${numericId}.pdf"`);
+        doc.registerFont('FZYTJW', PDF_FONT_PATH);
+        doc.pipe(res);
+
+        // 标题栏
+        doc.rect(0, 0, doc.page.width, 90).fill('#0a2e5d');
+        doc.font('FZYTJW').fontSize(24).fillColor('#ffffff')
+            .text('故障报告', 0, 30, { align: 'center' });
+        doc.fontSize(10)
+            .text(`生成时间：${new Date().toLocaleString('zh-CN')}`, 0, 62, { align: 'center' });
+
+        // 字段列表（基础字段 + 相机告警扩展字段）
+        const fields = [
+            ['故障编号', warning.code],
+            ['故障类型', warning.content],
+            ['预警时间', formatPdfTime(warning.time)],
+            ['维修工号', warning.worker],
+            ...(warning.level ? [['告警级别', warning.level]] : []),
+            ...(warning.value !== undefined && warning.value !== null ? [['数值', String(warning.value)]] : []),
+            ...(warning.carNumber ? [['车号', warning.carNumber]] : []),
+            ...(warning.line ? [['线路', warning.line]] : []),
+            ...(warning.station ? [['车站', warning.station]] : []),
+            ...(warning.direction ? [['方向', warning.direction]] : []),
+            ...(warning.location ? [['位置', warning.location]] : []),
+            ...(warning.mileage ? [['里程', warning.mileage]] : []),
+            ...(warning.speed !== undefined && warning.speed !== null ? [['速度', String(warning.speed)]] : []),
+            ['备注', warning.remark || '/'],
+        ];
+
+        let y = 130;
+        for (const [label, value] of fields) {
+            doc.font('FZYTJW').fontSize(11).fillColor('#0a2e5d')
+                .text(label, 60, y, { width: 100 });
+            doc.fillColor('#333333')
+                .text(String(value ?? '--'), 180, y, { width: 370 });
+            y += 28;
+            doc.moveTo(60, y - 8).lineTo(doc.page.width - 60, y - 8)
+                .lineWidth(0.5).strokeColor('#c9d8ea').stroke();
+        }
+
+        doc.end();
+    } catch (err) {
+        console.error('❌ PDF 生成失败:', err);
+        res.status(500).json({ error: 'PDF 生成失败' });
+    }
+});
+
 app.use('/uploads', express.static(uploadDir));
 
 // ============================================================
@@ -507,13 +598,17 @@ const PLC_CONFIG = {
     registers: {
         temperature: parseInt(process.env.PLC_REG_TEMP) || 30001,
         pressure: parseInt(process.env.PLC_REG_PRESS) || 30002,
-        humidity: parseInt(process.env.PLC_REG_HUMID) || 30003
+        humidity: parseInt(process.env.PLC_REG_HUMID) || 30003,
+        status: parseInt(process.env.PLC_REG_STATUS) || 30004,
+        seq: parseInt(process.env.PLC_REG_SEQ) || 30005,
+        subBase: parseInt(process.env.PLC_REG_SUB_BASE) || 30011,
+        writeForce: parseInt(process.env.PLC_REG_WRITE_FORCE) || 30021,
+        writeHeight: parseInt(process.env.PLC_REG_WRITE_HEIGHT) || 30022
     },
     readInterval: parseInt(process.env.PLC_INTERVAL) || 2000,
     windowSize: parseInt(process.env.PLC_WINDOW) || 10
 };
 
-let SIMULATION_MODE = process.env.PLC_MODE === 'simulation';
 let plcClient = null;
 let sensorBuffer = [];
 let isPLCConnecting = false;
@@ -521,65 +616,86 @@ let realInterval = null;
 let simulationInterval = null;
 let isSimulationPaused = false;
 
-// ---------- 故障分析逻辑 ----------
+// PLC 重连退避（失败后 2s 起步，翻倍至 30s 封顶）
+const PLC_RECONNECT_INITIAL_MS = 2000;
+const PLC_RECONNECT_MAX_MS = 30000;
+let plcReconnectDelay = PLC_RECONNECT_INITIAL_MS;
+let plcRetryAt = 0;
+
+// ---------- 故障分析逻辑（阈值单一来源：plc-packet.js THRESHOLDS） ----------
 function analyzeFault(data) {
     const faults = [];
-    if (data.temperature > 80) {
+    if (data.temperature > THRESHOLDS.tempHigh) {
         faults.push({
             type: '高温预警',
             level: 'warning',
             value: data.temperature,
-            detail: `均值温度 ${data.temperature}°C > 80°C`
+            detail: `均值温度 ${data.temperature}°C > ${THRESHOLDS.tempHigh}°C`
         });
-    } else if (data.temperature < -10) {
+    } else if (data.temperature < THRESHOLDS.tempLow) {
         faults.push({
             type: '低温预警',
             level: 'warning',
             value: data.temperature,
-            detail: `均值温度 ${data.temperature}°C < -10°C`
+            detail: `均值温度 ${data.temperature}°C < ${THRESHOLDS.tempLow}°C`
         });
     }
-    if (data.pressure > 1000) {
+    if (data.pressure > THRESHOLDS.pressHigh) {
         faults.push({
             type: '高压报警',
             level: 'error',
             value: data.pressure,
-            detail: `均值压力 ${data.pressure}kPa > 1000kPa`
+            detail: `均值压力 ${data.pressure}kPa > ${THRESHOLDS.pressHigh}kPa`
         });
-    } else if (data.pressure < 100) {
+    } else if (data.pressure < THRESHOLDS.pressLow) {
         faults.push({
             type: '低压报警',
             level: 'error',
             value: data.pressure,
-            detail: `均值压力 ${data.pressure}kPa < 100kPa`
+            detail: `均值压力 ${data.pressure}kPa < ${THRESHOLDS.pressLow}kPa`
         });
     }
-    if (data.humidity > 85) {
+    if (data.humidity > THRESHOLDS.humidHigh) {
         faults.push({
             type: '高湿预警',
             level: 'warning',
             value: data.humidity,
-            detail: `均值湿度 ${data.humidity}% > 85%`
+            detail: `均值湿度 ${data.humidity}% > ${THRESHOLDS.humidHigh}%`
         });
     }
     return faults;
 }
 
-function broadcastSensorData(avg, faults) {
+function broadcastSensorData(avg, faults, extra = {}) {
     const payload = {
         timestamp: new Date().toISOString(),
         temperature: avg.temperature,
         pressure: avg.pressure,
         humidity: avg.humidity,
         faults: faults,
-        type: faults.length > 0 ? 'alarm' : 'normal'
+        type: faults.length > 0 ? 'alarm' : 'normal',
+        // 扩展字段：数据源 / 异常子包 / 原始报文 / 控制状态
+        source: extra.source || 'simulation',
+        anomalies: extra.anomalies || faults,
+        packet: extra.packet || null,
+        control: extra.control || (controlEngine ? controlEngine.getStatus() : null)
     };
     io.emit('sensorData', payload);
     return payload;
 }
 
+// 告警去重：同类型 10s 内且数值变化 <5% 不重复入库（防 2s 轮询刷屏）
+const lastAlarmAt = {};
+
 async function handleAlarm(faults, avg) {
     for (const fault of faults) {
+        const prev = lastAlarmAt[fault.type];
+        const value = Number(fault.value) || 0;
+        if (prev && Date.now() - prev.time < 10000
+            && Math.abs(prev.value - value) <= Math.max(5, Math.abs(prev.value) * 0.05)) {
+            continue; // 重复告警，跳过
+        }
+        lastAlarmAt[fault.type] = { time: Date.now(), value: value };
         const warning = {
             code: 'PLC_SENSOR',
             content: fault.type,
@@ -600,16 +716,59 @@ async function handleAlarm(faults, avg) {
             worker: warning.worker,
             remark: warning.remark
         };
-        currentWarningList.push(memWarning);
+        pushWarning(memWarning);
     }
 
-    const counts = {};
-    currentWarningList.forEach(w => { counts[w.content] = (counts[w.content] || 0) + 1; });
-    currentOverLimit = currentOverLimit.map(card => ({
-        ...card,
-        count: counts[card.title] || 0,
-    }));
+    updateOverLimitStats();
     broadcastFullUpdate();
+}
+
+// ---------- Modbus 请求互斥锁（FC03 读 / FC16 写串行化） ----------
+let modbusChain = Promise.resolve();
+function modbusEnqueue(fn) {
+    const p = modbusChain.then(fn, fn);
+    modbusChain = p.catch(() => {});
+    return p;
+}
+
+// ---------- 控制引擎（双环 PID + Z-N 整定） ----------
+const controlEngine = createControlEngine();
+let latestSensor = null;        // 最近一次传感器均值（喂给控制引擎）
+let lastPacket = null;          // 最近一次原始报文（/api/plc/packet 调试用）
+let controlLoopInterval = null;
+let lastWrittenForce = null;    // 写回去重
+let lastWrittenHeight = null;
+let lastWriteAt = 0;            // 最近写回时间：输出不变时每 5s 保活重写（ZN 整定期间输出恒定，防止 PLC 侧写回看门狗/模拟器漂移）
+
+function startControlLoop() {
+    if (controlLoopInterval) return;
+    controlLoopInterval = setInterval(() => {
+        const mode = SIMULATION_MODE ? 'simulation' : 'plc';
+        controlEngine.tick(latestSensor, mode);
+
+        // 写回：自动调节或整定中的回路，输出变化时 FC16 写 30021/30022；
+        // 输出不变则每 5s 保活重写一次（整定阶跃期间输出恒定，防止 PLC 侧看门狗判超时）
+        if (!SIMULATION_MODE && plcClient) {
+            const st = controlEngine.getStatus();
+            const tuning = st.tune && st.tune.state === 'sampling';
+            const forceActive = st.loops.force.auto || (tuning && st.tune.loop === 'force');
+            const postureActive = st.loops.posture.auto || (tuning && st.tune.loop === 'posture');
+            const forceRaw = Math.round(Math.min(1000, Math.max(50, st.loops.force.output)) * 10); // 压力寄存器 ×10（1000kPa→10000，uint16 安全）
+            const heightRaw = Math.round(Math.min(2600, Math.max(1000, st.loops.posture.output)));
+            const anyActive = forceActive || postureActive;
+            const forceChanged = forceRaw !== lastWrittenForce;
+            const heightChanged = heightRaw !== lastWrittenHeight;
+            const keepAlive = anyActive && Date.now() - lastWriteAt > 5000;
+            if (anyActive && (forceChanged || heightChanged || keepAlive)) {
+                if (forceChanged) lastWrittenForce = forceRaw;
+                if (heightChanged) lastWrittenHeight = heightRaw;
+                lastWriteAt = Date.now();
+                modbusEnqueue(() => plcClient.writeRegisters(
+                    PLC_CONFIG.registers.writeForce, [forceRaw, heightRaw]))
+                    .catch((err) => console.error('⚠️ 写回 PLC 失败（不影响采集）:', err.message));
+            }
+        }
+    }, controlEngine.config.controlInterval);
 }
 
 // ---------- 真实PLC采集 ----------
@@ -632,40 +791,74 @@ async function connectPLC() {
 
 async function readAndBufferSensorData() {
     if (!plcClient) {
+        if (Date.now() < plcRetryAt) return; // 退避等待中，跳过本次重连
         plcClient = await connectPLC();
         if (!plcClient) {
-            if (!SIMULATION_MODE) {
-                console.warn('⚠️ 自动切换到模拟模式');
-                SIMULATION_MODE = true;
-                startSimulation();
-            }
+            plcReconnectDelay = Math.min(plcReconnectDelay * 2, PLC_RECONNECT_MAX_MS);
+            plcRetryAt = Date.now() + plcReconnectDelay;
+            console.warn(`⚠️ PLC 连接失败，${(plcReconnectDelay / 1000).toFixed(0)}s 后重试`);
             return;
         }
     }
 
     try {
-        const tempData = await plcClient.readHoldingRegisters(PLC_CONFIG.registers.temperature, 1);
-        const temp = tempData.data[0] / 10;
-        const pressData = await plcClient.readHoldingRegisters(PLC_CONFIG.registers.pressure, 1);
-        const pressure = pressData.data[0] / 100;
-        const humidData = await plcClient.readHoldingRegisters(PLC_CONFIG.registers.humidity, 1);
-        const humidity = humidData.data[0] / 10;
+        // 主包：30001-30005（地址连续，一次批量读取）
+        const regs = await modbusEnqueue(() =>
+            plcClient.readHoldingRegisters(PLC_CONFIG.registers.temperature, 5)
+                .then((r) => r.data));
+        const packet = parseMainPacket(regs);
+        plcReconnectDelay = PLC_RECONNECT_INITIAL_MS; // 读取成功，重置退避
 
-        const record = {
-            timestamp: Date.now(),
-            temperature: Math.round(temp * 10) / 10,
-            pressure: Math.round(pressure * 100) / 100,
-            humidity: Math.round(humidity * 10) / 10
-        };
-        sensorBuffer.push(record);
-        console.log(`📥 缓存第 ${sensorBuffer.length}/${PLC_CONFIG.windowSize} 条`);
+        if (packet.extended) {
+            // ===== 新固件扩展协议：直接用 PLC 侧 10 条均值，不再二次平均 =====
+            const avg = {
+                temperature: Math.round(packet.temperature * 10) / 10,
+                pressure: Math.round(packet.pressure * 100) / 100,
+                humidity: Math.round(packet.humidity * 10) / 10
+            };
+            latestSensor = avg;
 
-        if (sensorBuffer.length >= PLC_CONFIG.windowSize) {
-            await processBuffer();
+            let sub = null;
+            let faults = [];
+            if (packet.subValid) {
+                const subRegs = await modbusEnqueue(() =>
+                    plcClient.readHoldingRegisters(PLC_CONFIG.registers.subBase, 5)
+                        .then((r) => r.data));
+                sub = parseSubPacket(subRegs);
+                faults = anomaliesFromBitmap(sub.bitmap || packet.anomalyBitmap, sub.values);
+            } else if (packet.anomalyBitmap) {
+                faults = anomaliesFromBitmap(packet.anomalyBitmap, {
+                    temperature: packet.temperature,
+                    pressure: packet.pressure,
+                    humidity: packet.humidity
+                });
+            }
+            lastPacket = { source: 'plc', main: packet, sub, receivedAt: Date.now() };
+            broadcastSensorData(avg, faults, {
+                source: 'plc', anomalies: faults, packet: lastPacket
+            });
+            if (faults.length > 0) {
+                await handleAlarm(faults, avg);
+                console.log(`🚨 [PLC] seq=${packet.seq} 检测到 ${faults.length} 个异常（子包序号=${sub ? sub.subSeq : '-'}）`);
+            }
+        } else {
+            // ===== 旧固件回退：平台侧 10 条缓冲均值 =====
+            const record = {
+                timestamp: Date.now(),
+                temperature: Math.round(packet.temperature * 10) / 10,
+                pressure: Math.round(packet.pressure * 100) / 100,
+                humidity: Math.round(packet.humidity * 10) / 10
+            };
+            sensorBuffer.push(record);
+            if (sensorBuffer.length >= PLC_CONFIG.windowSize) {
+                await processBuffer();
+            }
         }
     } catch (err) {
         console.error('❌ 读取传感器数据失败:', err.message);
         plcClient = null;
+        plcReconnectDelay = Math.min(plcReconnectDelay * 2, PLC_RECONNECT_MAX_MS);
+        plcRetryAt = Date.now() + plcReconnectDelay;
     }
 }
 
@@ -683,13 +876,12 @@ async function processBuffer() {
         pressure: Math.round((sum.press / count) * 100) / 100,
         humidity: Math.round((sum.humid / count) * 10) / 10
     };
+    latestSensor = avg;
     const faults = analyzeFault(avg);
-    broadcastSensorData(avg, faults);
+    broadcastSensorData(avg, faults, { source: 'fallback' });
     if (faults.length > 0) {
         await handleAlarm(faults, avg);
-        console.log(`🚨 检测到 ${faults.length} 个故障`);
-    } else {
-        console.log('✅ 数据正常');
+        console.log(`🚨 [旧固件回退] 检测到 ${faults.length} 个故障`);
     }
     sensorBuffer = [];
 }
@@ -719,13 +911,12 @@ function startSimulation() {
             pressure: Math.round(pressure * 100) / 100,
             humidity: Math.round(humidity * 10) / 10
         };
+        latestSensor = avg;
         const faults = analyzeFault(avg);
-        broadcastSensorData(avg, faults);
+        broadcastSensorData(avg, faults, { source: 'simulation' });
         if (faults.length > 0) {
             handleAlarm(faults, avg).catch(console.error);
             console.log(`🚨 [模拟] 检测到 ${faults.length} 个故障`);
-        } else {
-            console.log(`📊 [模拟] 温度 ${avg.temperature}°C, 压力 ${avg.pressure}kPa, 湿度 ${avg.humidity}%`);
         }
     }, PLC_CONFIG.readInterval);
 }
@@ -790,9 +981,60 @@ app.get('/api/simulation/pause', (req, res) => {
 });
 
 app.post('/api/simulation/pause', (req, res) => {
-    isSimulationPaused = !isSimulationPaused;
+    const body = req.body;
+    if (body && typeof body.paused === 'boolean') {
+        isSimulationPaused = body.paused;
+    } else {
+        isSimulationPaused = !isSimulationPaused; // 兼容旧调用：无 body 时切换
+    }
     console.log(`⏸️ 模拟数据${isSimulationPaused ? '已暂停' : '已恢复'}`);
     res.json({ paused: isSimulationPaused });
+});
+
+// ---------- API：PLC 报文与控制引擎 ----------
+app.get('/api/plc/packet', (req, res) => {
+    res.json(lastPacket || { source: 'plc', main: null, sub: null, receivedAt: null });
+});
+
+app.get('/api/control/status', (req, res) => {
+    res.json(controlEngine.getStatus());
+});
+
+app.post('/api/control/params', (req, res) => {
+    const { loop, kp, ki, kd, target } = req.body || {};
+    if (loop !== 'force' && loop !== 'posture') {
+        return res.status(400).json({ error: 'loop 必须是 force 或 posture' });
+    }
+    const r = controlEngine.setParams(loop, { kp, ki, kd, target });
+    if (!r.ok) return res.status(400).json({ error: r.error });
+    console.log(`🎛️ PID 参数已更新 [${loop}]`, { kp, ki, kd, target });
+    res.json({ ok: true, status: controlEngine.getStatus() });
+});
+
+app.post('/api/control/auto', (req, res) => {
+    const { loop, enabled } = req.body || {};
+    if (loop !== 'force' && loop !== 'posture') {
+        return res.status(400).json({ error: 'loop 必须是 force 或 posture' });
+    }
+    const r = controlEngine.setAuto(loop, enabled !== false);
+    if (!r.ok) return res.status(400).json({ error: r.error });
+    console.log(`🤖 自动调节 [${loop}] ${enabled !== false ? '开启' : '关闭'}`);
+    res.json({ ok: true, status: controlEngine.getStatus() });
+});
+
+app.post('/api/control/tune', (req, res) => {
+    const { loop } = req.body || {};
+    const r = controlEngine.startTune(loop);
+    if (!r.ok) return res.status(400).json({ error: r.error });
+    console.log(`📈 Z-N 阶跃整定已开始 [${loop}]，阶跃 Δu=${r.stepDelta}`);
+    res.json({ ok: true, stepDelta: r.stepDelta, status: controlEngine.getStatus() });
+});
+
+app.post('/api/control/tune/cancel', (req, res) => {
+    const r = controlEngine.cancelTune();
+    if (!r.ok) return res.status(400).json({ error: r.error });
+    console.log('🛑 Z-N 整定已取消');
+    res.json({ ok: true, status: controlEngine.getStatus() });
 });
 
 // ============================================================
@@ -804,13 +1046,7 @@ app.delete('/api/simulation/clear', async (req, res) => {
         currentWarningList = currentWarningList.filter(w => w.code !== 'PLC_SENSOR');
         const removed = before - currentWarningList.length;
 
-        const counts = {};
-        currentWarningList.forEach(w => { counts[w.content] = (counts[w.content] || 0) + 1; });
-        currentOverLimit = currentOverLimit.map(card => ({
-            ...card,
-            count: counts[card.title] || 0,
-        }));
-
+        updateOverLimitStats();
         broadcastFullUpdate();
         console.log(`🧹 已清除 ${removed} 条模拟告警记录`);
         res.json({ success: true, memRemoved: removed });
@@ -837,4 +1073,6 @@ const PORT = process.env.PORT || 3000;
     } else {
         await startRealCollection();
     }
+
+    startControlLoop(); // 双环 PID 控制引擎（模拟/真实模式均驱动）
 })();

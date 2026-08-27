@@ -57,19 +57,22 @@
 import { ref } from 'vue'
 import { useRouter } from 'vue-router'
 const router = useRouter()
-// 菜单展开/收起事件
-const handleOpen = (key, keyPath) => {
-  console.log('菜单展开:', key, keyPath)
-}
-const handleClose = (key, keyPath) => {
-  console.log('菜单收起:', key, keyPath)
-}
 
-// 菜单选中事件（关键）
+// 菜单展开/收起事件（预留）
+const handleOpen = () => {}
+const handleClose = () => {}
+
+// 菜单选中事件
 const currentActive = ref('monitor_line')
+// 分组菜单 '2-x'/'3-x'/'4-x' 映射到真实路由
+const MENU_ROUTE_MAP = {
+  '2-1': 'monitor_global', '2-2': 'monitor_line', '2-3': 'monitor_car', '2-4': 'fault_overview',
+  '3-1': 'monitor_global', '3-2': 'monitor_line', '3-3': 'monitor_car', '3-4': 'fault_overview',
+  '4-1': 'monitor_global', '4-2': 'monitor_line', '4-3': 'monitor_car', '4-4': 'fault_overview',
+}
 const handleMenuSelect = (key) => {
   currentActive.value = key
-  router.push(key)
+  router.push(MENU_ROUTE_MAP[key] || key)
 }
 </script>
 

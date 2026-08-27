@@ -1785,7 +1785,7 @@
 </template>
 
 <script setup>
-import { ref, reactive, onMounted, nextTick } from 'vue'
+import { ref, reactive, onMounted, onUnmounted, nextTick } from 'vue'
 
 const carWidth = 36
 const carHeight = 16
@@ -2116,6 +2116,7 @@ function getCarPosition(globalProgress) {
 }
 
 // 动画主循环
+let animationFrameId = null
 function animate() {
   cars.forEach((car) => {
     // 主路线速度
@@ -2172,7 +2173,7 @@ function animate() {
   // 调用新小车的动画
   animateNewCars()
 
-  requestAnimationFrame(animate)
+  animationFrameId = requestAnimationFrame(animate)
 }
 
 onMounted(() => {
@@ -2182,6 +2183,10 @@ onMounted(() => {
     updateSegmentLengths()
     animate()
   })
+})
+
+onUnmounted(() => {
+  if (animationFrameId) cancelAnimationFrame(animationFrameId)
 })
 </script>
 

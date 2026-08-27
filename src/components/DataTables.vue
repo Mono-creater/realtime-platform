@@ -215,15 +215,6 @@ const statusConfig = {
   oddRowBGC: 'rgba(10,46,93,0.3)',
   evenRowBGC: 'rgba(10,46,93,0.1)',
   align: ['center'],
-  renderCell({ rowIndex, columnIndex, value }) {
-    if (columnIndex === 0) {
-      return `<img src="${greenC}" style="width:16px;vertical-align:middle;margin-right:2px;" />${value}`
-    }
-    if (columnIndex === 4) {
-      return `<img src="${greenPeople}" style="width:16px;vertical-align:middle;margin-right:2px;" />${value}`
-    }
-    return value
-  },
 }
 
 function handleAlarmRowClick(e) {

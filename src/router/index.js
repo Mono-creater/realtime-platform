@@ -5,7 +5,7 @@ import MonitorLine from '@/views/SmartDetection/MonitorLine.vue'
 import MonitorCar from '@/views/SmartDetection/MonitorCar.vue'
 import FaultOverview from '@/views/SmartDetection/FaultOverview.vue'
 import Line_Pantograph from '@/views/SmartDetection/Line_Pantograph2.vue'
-import Line_Pantograph_Warning from '@/views/SmartDetection/Line_Pantograph_Warning.vue'
+import PantographWarning from '@/views/SmartDetection/PantographWarning.vue'
 
 const router = createRouter({
   history: createWebHistory(import.meta.env.BASE_URL),
@@ -18,7 +18,7 @@ const router = createRouter({
       children: [
         {
           path: '/',
-          name: 'MonitorGlobal',
+          name: 'MonitorGlobalRoot',
           component: MonitorGlobal,
         },
         {
@@ -49,17 +49,16 @@ const router = createRouter({
       name: 'LinePantograph',
       component: Line_Pantograph,
     },
-    // 受电弓告警详情（原路由，保持兼容）
-    {
-      path: '/moterline_pantograph_warning',
-      name: 'LinePantographWarning',
-      component: Line_Pantograph_Warning,
-    },
-    // ===== 新增：告警详情页（统一跳转名称） =====
+    // 告警详情（数据驱动页；旧路由重定向兼容，透传 query）
     {
       path: '/pantograph-warning',
       name: 'PantographWarning',
-      component: Line_Pantograph_Warning,
+      component: PantographWarning,
+    },
+    {
+      path: '/moterline_pantograph_warning',
+      name: 'LinePantographWarning',
+      redirect: (to) => ({ name: 'PantographWarning', query: to.query }),
     },
   ],
 })

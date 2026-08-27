@@ -100,9 +100,8 @@ export function drawRadialLines (ctx, x, y, innerRadius, outerRadius, count, str
  * @param {String} fillStyle 填充样式
  * @param {String} inactiveFillStyle 未激活的填充样式
  * @param {Number} activeCount 激活的发光块数量
- * @param {Number} glowIntensity 发光强度 (0-1)
  */
-export function drawGlowBlocks (ctx, x, y, radius, count, blockWidth, fillStyle, inactiveFillStyle, activeCount, glowIntensity = 1) {
+export function drawGlowBlocks (ctx, x, y, radius, count, blockWidth, fillStyle, inactiveFillStyle, activeCount) {
   const angleStep = (Math.PI * 2) / count;
 
   for (let i = 0;i < count;i++) {

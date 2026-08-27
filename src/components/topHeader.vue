@@ -20,7 +20,7 @@
 </template>
 
 <script setup>
-import { ref, onMounted } from 'vue'
+import { ref, onMounted, onUnmounted } from 'vue'
 
 // 运行天数（动态计算，参考之前的代码）
 const runDays = ref(0)
@@ -47,23 +47,22 @@ function updateTime() {
   nowTime.value = `${y}年${m}月${d}日  ${h}:${min}:${s}  ${week}`
 }
 
+let clockTimer = null
 onMounted(() => {
   updateDays()
   updateTime()
-  setInterval(() => {
+  clockTimer = setInterval(() => {
     updateDays()
     updateTime()
   }, 1000)
 })
+
+onUnmounted(() => {
+  if (clockTimer) clearInterval(clockTimer)
+})
 </script>
 
 <style scoped>
-@font-face {
-  font-family: 'FZYTJW';
-  src: url('@/assets/fonts/FZYTJW.TTF') format('truetype');
-  font-weight: normal;
-  font-style: normal;
-}
 #top-header {
   position: relative;
   width: 100%;

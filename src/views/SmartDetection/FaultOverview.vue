@@ -35,6 +35,18 @@
             {{ row.remark === '/' ? '—' : row.remark }}
           </template>
         </el-table-column>
+        <el-table-column label="操作" width="110" align="center" fixed="right">
+          <template #default="{ row }">
+            <el-button
+              size="small"
+              type="primary"
+              plain
+              @click.stop="exportPdf(row)"
+            >
+              📄 导出PDF
+            </el-button>
+          </template>
+        </el-table-column>
       </el-table>
 
       <!-- 空状态（无数据或搜索无结果） -->
@@ -50,8 +62,7 @@
 
 <script setup>
 import { ref, computed, onMounted, onBeforeUnmount, watch, nextTick } from 'vue'
-import axios from 'axios'
-import { ElMessage } from 'element-plus'
+import api from '@/utils/api'
 
 // ---------- 数据 ----------
 const allData = ref([])
@@ -79,7 +90,7 @@ const filteredData = computed(() => {
 // ---------- 获取数据 ----------
 async function fetchData() {
   try {
-    const res = await axios.get('http://localhost:3000/api/history')
+    const res = await api.get('/api/history')
     allData.value = res.data.map(item => ({
       id: item.id,
       code: item.code,
@@ -110,6 +121,16 @@ function handleRowClick(row) {
 // 行类名动态绑定
 function rowClassName({ row }) {
   return row.id === selectedRowId.value ? 'selected-row' : ''
+}
+
+// ---------- 导出指定故障 PDF ----------
+function exportPdf(row) {
+  const link = document.createElement('a')
+  link.href = `/api/export/pdf/${row.id}`
+  link.download = `fault-${row.id}.pdf`
+  document.body.appendChild(link)
+  link.click()
+  link.remove()
 }
 
 // ---------- 自动滚动 ----------

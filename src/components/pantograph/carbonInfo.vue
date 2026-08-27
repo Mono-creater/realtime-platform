@@ -95,7 +95,7 @@
 <script setup>
 import { ref, computed, onMounted, onUnmounted } from 'vue'
 import { useRouter } from 'vue-router'
-import axios from 'axios'
+import api from '@/utils/api'
 import over1 from '@/assets/images/over12.png'
 import over2 from '@/assets/images/over22.png'
 import over3 from '@/assets/images/over33.png'
@@ -131,7 +131,7 @@ function updateWarningData(newList) {
 // ---------- 从历史 API 加载初始数据 ----------
 async function fetchInitialData() {
   try {
-    const response = await axios.get('http://localhost:3000/api/history')
+    const response = await api.get('/api/history')
     // 转换数据格式（确保 time 为字符串 yyyy-mm-dd）
     const history = response.data.map(item => ({
       id: item.id,
@@ -142,7 +142,6 @@ async function fetchInitialData() {
       remark: item.remark || '/',
     }))
     updateWarningData(history)
-    console.log('✅ 初始数据加载完成，共', history.length, '条')
   } catch (err) {
     console.error('❌ 加载历史数据失败:', err)
     // 如果后端未启动，保留空数据，等待 WebSocket 推送
@@ -195,16 +194,18 @@ function closeModal() {
   }, 200)
 }
 
-// ---------- 原有方法：点击滚动板跳转 ----------
+// ---------- 点击滚动板：跳转到数据驱动的告警详情页 ----------
 function handleClick(e) {
+  const row = e && Array.isArray(e.row) ? e.row : []
+  const found = row[1] ? warningList.value.find(w => w.code === row[1]) : null
   router.push({
-    name: 'LinePantographWarning',
+    name: 'PantographWarning',
+    query: { id: found ? found.id : undefined },
   })
 }
 
 // ---------- WebSocket 事件处理 ----------
 function handleFullUpdate(data) {
-  console.log('收到实时更新:', data) // 可保留用于调试
   // 更新预警列表
   if (data.warningList) {
     warningList.value = data.warningList

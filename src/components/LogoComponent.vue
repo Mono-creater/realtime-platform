@@ -16,12 +16,6 @@
 </script>
 
 <style scoped>
-@font-face {
-  font-family: 'FZYTJW';
-  src: url('@/assets/fonts/FZYTJW.TTF') format('truetype');
-  font-weight: normal;
-  font-style: normal;
-}
 .logos {
   font-family: 'FZYTJW', sans-serif;
   color: #fff;
