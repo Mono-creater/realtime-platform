@@ -13,7 +13,9 @@ model WarningHistory {
   content   String
   time      DateTime
   worker    String?
-  remark    String?
+  // 备注可能包含触发数据或调试 JSON，长度远超默认 VARCHAR(191)，
+  // 故显式声明为 TEXT，避免 "value too long for the column's type" 导致告警静默丢失
+  remark    String?  @db.Text
   createdAt DateTime @default(now()) @map("created_at")
   @@map("warning_history")
 }
@@ -32,4 +34,23 @@ model User {
   password String
   role     String @default("viewer")
   @@map("users")
+}
+
+/// 过程数据采样：环境量（温度/压力/湿度）与双环被控量、控制输出。
+/// 用途仅为 Z-N 辨识与 PID 三参数（Kp/Ki/Kd）整定的数据来源，
+/// 不参与告警：环境因素引起的预警只推前端、不入库。
+model SensorSample {
+  id           Int      @id @default(autoincrement())
+  time         DateTime
+  temperature  Float?
+  pressure     Float?
+  humidity     Float?
+  contactForce Float?
+  height       Float?
+  outputForce  Float?
+  outputHeight Float?
+  seq          Int?
+  createdAt    DateTime @default(now()) @map("created_at")
+  @@index([time])
+  @@map("sensor_sample")
 }

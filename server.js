@@ -152,7 +152,11 @@ const ENV_WARNING_CONTENTS = ['高温预警', '低温预警', '高湿预警'];
 const ENV_WARNING_CAUSES = {
     '高温预警': '环境温度过高所致，属环境因素，非碳滑板部件故障；建议检查环境散热与空调',
     '低温预警': '环境温度过低所致，属环境因素，非碳滑板部件故障；低温下碳条变脆，建议关注取流状态',
-    '高湿预警': '环境湿度过高所致，属环境因素，非碳滑板部件故障；高湿易加剧燃弧，建议加强除湿通风'
+    '高湿预警': '环境湿度过高所致，属环境因素，非碳滑板部件故障；高湿易加剧燃弧，建议加强除湿通风',
+    // 压力类告警同样给出成因说明：否则会落入调试 JSON 分支，
+    // 备注长度超过数据库列宽导致入库失败
+    '高压报警': '气囊压力高于上限，可能因比例阀卡滞、气源压力偏高或压力传感器漂移；建议核查气路与阀件',
+    '低压报警': '气囊压力低于下限，可能因气路泄漏、气源压力不足或升弓机构卡阻；建议检查气密性与供气'
 };
 // 备注取值：环境类预警的历史数据可能是空、'/' 或 JSON 调试串，统一兜底为成因说明
 function resolveEnvRemark(content, remark) {
@@ -163,18 +167,74 @@ function resolveEnvRemark(content, remark) {
     return remark;
 }
 
+// ---------- 落库口径 ----------
+// 环境类预警（高温/低温/高湿）不入库，只推前端：它们只反映气候与环境，不反映设备状态；
+// 环境量的真正用途是作为 PID 三参数整定的过程数据，写入 sensor_sample 表。
+const PERSIST_ENV_WARNINGS = String(process.env.PERSIST_ENV_WARNINGS || 'false').toLowerCase() === 'true';
+const PERSIST_SAMPLES = String(process.env.PERSIST_SAMPLES || 'true').toLowerCase() !== 'false';
+const SAMPLE_INTERVAL_MS = Math.max(1000, Number(process.env.SAMPLE_INTERVAL_S || 10) * 1000);
+
+// 采样写库：按 SAMPLE_INTERVAL_MS 节流 + 批量落库，采集主流程不因写库阻塞
+let lastSampleAt = 0;
+let sampleQueue = [];
+let sampleFlushing = false;
+let samplePersisted = 0;
+
+function collectSample(avg, seq) {
+    if (!PERSIST_SAMPLES || !prisma) return;
+    const now = Date.now();
+    if (now - lastSampleAt < SAMPLE_INTERVAL_MS) return;
+    lastSampleAt = now;
+    let loops = {};
+    try { loops = (controlEngine.getStatus() || {}).loops || {}; } catch { /* 控制器未就绪 */ }
+    sampleQueue.push({
+        time: new Date(now),
+        temperature: avg.temperature,
+        pressure: avg.pressure,
+        humidity: avg.humidity,
+        contactForce: loops.force ? loops.force.measurement : null,
+        height: loops.posture ? loops.posture.measurement : null,
+        outputForce: loops.force ? loops.force.output : null,
+        outputHeight: loops.posture ? loops.posture.output : null,
+        seq: seq == null ? null : seq
+    });
+    flushSamples();
+}
+
+async function flushSamples() {
+    if (!prisma || sampleFlushing || sampleQueue.length === 0) return;
+    sampleFlushing = true;
+    const batch = sampleQueue.splice(0, 200);
+    try {
+        await prisma.sensorSample.createMany({ data: batch });
+        samplePersisted += batch.length;
+    } catch (err) {
+        console.warn('⚠️ 采样落库失败（不影响实时采集）:', err.message);
+    } finally {
+        sampleFlushing = false;
+    }
+}
+
 async function saveWarningToHistory(warning) {
   if (!prisma) {
     console.log('💾 模拟模式：保存警告到内存（不持久化）', warning);
     return { id: nextMemId() };
   }
+  // 环境因素引起的预警（高温/低温/高湿）不落库：这类量只用于 PID 整定的过程数据，
+  // 其预警值随时间与气候变化，入库会淹没有价值的设备告警。仅推送前端与内存列表。
+  if (!PERSIST_ENV_WARNINGS && ENV_WARNING_CONTENTS.includes(warning.content)) {
+    return { id: nextMemId(), persisted: false, reason: '环境类预警按配置不入库' };
+  }
+  // 兜底截断：即使数据库列被建成较短的 VARCHAR，也不因单条备注过长而丢掉整条告警
+  const REMARK_MAX = Number(process.env.WARNING_REMARK_MAX || 2000);
+  const remark = warning.remark == null ? null : String(warning.remark).slice(0, REMARK_MAX);
   const created = await prisma.warningHistory.create({
     data: {
       code: warning.code,
       content: warning.content,
       time: new Date(warning.time),
       worker: warning.worker,
-      remark: warning.remark,
+      remark,
     },
   });
   return created;
@@ -898,6 +958,7 @@ async function readAndBufferSensorData() {
                 humidity: Math.round(packet.humidity * 10) / 10
             };
             latestSensor = avg;
+            collectSample(avg, packet.seq); // 环境量+双环状态写入整定数据集（节流）
 
             let sub = null;
             let faults = [];
@@ -931,6 +992,7 @@ async function readAndBufferSensorData() {
                 humidity: Math.round(packet.humidity * 10) / 10
             };
             sensorBuffer.push(record);
+            collectSample(record, packet.seq); // 旧固件回退路径同样写入整定数据集
             if (sensorBuffer.length >= PLC_CONFIG.windowSize) {
                 await processBuffer();
             }
@@ -1142,6 +1204,50 @@ app.delete('/api/simulation/clear', async (req, res) => {
 // ============================================================
 app.get('/api/v2/audit', sec.auditHandler());
 app.get('/api/v2/security', (req, res) => res.json(sec.status()));
+
+// ---- 整定数据集：环境量与双环过程量（Z-N 辨识 K/T/L → 计算 Kp/Ki/Kd 三参数） ----
+app.get('/api/v2/samples', async (req, res) => {
+    if (!prisma) return res.json({ persisted: false, count: 0, list: [], note: '当前为无数据库模式，采样只存在于内存' });
+    const limit = Math.min(Math.max(Number(req.query.limit) || 200, 1), 5000);
+    const where = {};
+    if (req.query.since) {
+        const d = new Date(req.query.since);
+        if (!isNaN(d.getTime())) where.time = { gte: d };
+    }
+    try {
+        const list = await prisma.sensorSample.findMany({ where, orderBy: { time: 'desc' }, take: limit });
+        res.json({
+            persisted: true, count: list.length, totalPersisted: samplePersisted,
+            intervalS: SAMPLE_INTERVAL_MS / 1000, sampleEnabled: PERSIST_SAMPLES, list
+        });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+app.get('/api/v2/tuning-dataset', async (req, res) => {
+    const loop = req.query.loop === 'posture' ? 'posture' : 'force';
+    if (!prisma) return res.json({ loop, rows: [], note: '无数据库模式：无法导出历史数据集' });
+    const limit = Math.min(Math.max(Number(req.query.limit) || 2000, 10), 20000);
+    try {
+        const rows = await prisma.sensorSample.findMany({ orderBy: { time: 'asc' }, take: limit });
+        const t0 = rows.length ? rows[0].time.getTime() : 0;
+        const data = rows.map((r) => ({
+            t: +((r.time.getTime() - t0) / 1000).toFixed(1),
+            u: loop === 'force' ? r.outputForce : r.outputHeight,
+            y: loop === 'force' ? r.contactForce : r.height,
+            temperature: r.temperature, pressure: r.pressure, humidity: r.humidity
+        }));
+        res.json({
+            loop, count: data.length, unit: loop === 'force' ? { u: 'kPa', y: 'N' } : { u: 'mm', y: 'mm' },
+            rows: data,
+            note: 'u=控制输出，y=被控量；用于一阶惯性加纯滞后 FOPDT 辨识 K、T、L，再按 Z-N 公式得 Kp、Ti、Td'
+        });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
 app.use('/api/v2', createUpgradeRouter({
     autoCreateOrder: String(process.env.AUTO_CREATE_ORDER || 'true').toLowerCase() !== 'false'
 }));
