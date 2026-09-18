@@ -1,7 +1,7 @@
 {
-  "pass": 36,
+  "pass": 51,
   "fail": 0,
-  "generatedAt": "2026-09-17T12:09:31.726Z",
+  "generatedAt": "2026-09-18T14:34:19.314Z",
   "results": {
     "standards": {
       "Fm_0": 70,
@@ -114,9 +114,9 @@
         "backoffStep": 0
       },
       "backoff": [
-        501,
-        1082,
-        1992
+        529,
+        908,
+        2136
       ],
       "writeVerify": {
         "ok": {
@@ -161,6 +161,53 @@
         }
       },
       "auditEntries": 5
+    },
+    "security": {
+      "tokenGuard": {
+        "disabledPass": true,
+        "unauthorized401": true,
+        "bearerOk": true,
+        "wrongToken401": true
+      },
+      "rateLimit": {
+        "codes": [
+          200,
+          200,
+          200,
+          429
+        ],
+        "retryAfterHeader": "20"
+      },
+      "audit": {
+        "tokenEnabled": false,
+        "rateLimitPerMin": 100,
+        "auditLimit": 500,
+        "auditCount": 2,
+        "corsOrigin": "不限（保持原行为）",
+        "securityHeaders": true,
+        "uploadAllowedExt": [
+          "jpg",
+          "jpeg",
+          "png",
+          "webp",
+          "gif",
+          "bmp",
+          "mp4",
+          "webm",
+          "mov",
+          "pdf"
+        ],
+        "uploadMaxMb": 50
+      },
+      "upload": {
+        "jpg": "allow",
+        "html": "deny",
+        "svg": "deny"
+      },
+      "gainLimit": {
+        "reject1e6": true,
+        "acceptNormal": true
+      }
     }
   }
 }

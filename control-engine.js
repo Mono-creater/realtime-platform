@@ -25,6 +25,9 @@ const envNum = (name, def) => {
     return Number(v);
 };
 
+// PID 增益允许上限（kV1.1 加固）：正常工程参数在个位数～十位数，超过此值几乎必为误设
+const GAIN_LIMIT = envNum('PID_GAIN_LIMIT', 100);
+
 const DEFAULTS = {
     // 接触力模型（实测标定）
     aEff: envNum('PANTO_A_EFF', 0.001),        // m²  气囊有效面积
@@ -396,6 +399,9 @@ function createControlEngine(options) {
             if (params[key] !== undefined) {
                 const v = Number(params[key]);
                 if (!Number.isFinite(v) || v < 0) return { ok: false, error: `${key} 必须是非负数字` };
+                if (key !== 'target' && v > GAIN_LIMIT) {
+                    return { ok: false, error: `${key} 超出允许上限 ${GAIN_LIMIT}（防止误设导致执行机构剧烈振荡）` };
+                }
                 if (key === 'target') {
                     // 目标必须落在该回路可实现的测量范围内
                     const measRange = loopKind === 'force'

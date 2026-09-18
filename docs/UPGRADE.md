@@ -1,7 +1,8 @@
 # realtime-platform 优化升级说明（v2，按社会/行业需求 + 现行标准与公式）
 
 > 升级对象：`D:\realtime-platform\realtime-platform-main`
-> 升级日期：2026-09-12　　测试脚本：`tests/run-tests.js`（36 项用例，全部通过，报告见 `tests/report.json`）
+> 升级日期：2026-09-12（v2 主体）／2026-09-18（v2.1 挂载与安全加固）
+> 测试脚本：`tests/run-tests.js`（**51 项用例，全部通过**，报告见 `tests/report.json`）
 
 ## 一、需求 → 改动 → 依据 对照
 
@@ -13,7 +14,8 @@
 | **可靠**：缓变异常要在越限前发现 | `alarm-engine.js`：中值滤波抗尖峰 + **变化率(ROC)判据** + 连续确认 + 抑制窗口；分级 warning/major/critical；确认/解除留痕 | 行业检修由“计划修”转“状态修”，要求早发现、可追溯；阈值为现场既有取值，分级与 ROC 阈值为可标定默认值 |
 | **智能**：状态修、分级整备 | `maintenance.js`：工单状态机（新建→指派→处理中→完成→复核→关闭）、审计轨迹、**健康指数与四档检修建议**、MTTR | 分级整备/状态修组织方式；健康指数为无厚度直接测量时的**代理指标**，投运前按线路数据标定 |
 | **可用**：运维要有量化 KPI | `standards.js` 提供可用率、数据完整率、丢包率、告警时延统计、MTTR 公式；`upgrade-routes.js` 暴露 `/api/v2/kpi` | 运维指标通用定义（可用率、完整率、MTTR） |
-| **合规**：写操作最小权限、可审计 | 架构上保持“平台只写两个白名单寄存器（30021/30022）”，新增写回读校验与全量审计；文档重申 502/554 不得直接暴露公网，须走隧道/VPN | GB/T 30976 系列（最小权限、审计、边界防护） |
+| **合规**：写操作最小权限、可审计 | 新增 `security.js`：写接口令牌校验（`API_TOKEN`）、按 IP 令牌桶限流、操作审计环形缓冲（`/api/v2/audit`）、上传扩展名白名单、安全响应头；架构上保持"平台只写两个白名单寄存器（30021/30022）"与写回读校验；文档重申 502/554 不得直接暴露公网，须走隧道/VPN | GB/T 30976 系列（最小权限、审计、速率限制、边界防护） |
+| **健壮**：控制参数不能误设 | `control-engine.js` 增加 `PID_GAIN_LIMIT`（默认 100）增益上限校验，配合既有的非负校验与目标可实现范围校验 | 工业控制器工程惯例；防止误下发导致执行机构剧烈振荡 |
 
 ## 二、新增/修改的文件
 
@@ -24,17 +26,28 @@
 | `alarm-engine.js` | 新增 | 告警引擎：中值滤波、ROC 判据、连续确认、抑制去重、分级、确认/解除、时延统计 |
 | `link-monitor.js` | 新增 | 链路质量：丢包率、质量码、心跳、退避重连、写入—回读校验 |
 | `maintenance.js` | 新增 | 工单状态机、审计轨迹、健康指数与检修建议、MTTR |
-| `upgrade-routes.js` | 新增 | REST 入口（`/api/v2/*`），挂载即生效 |
-| `tests/run-tests.js`、`tests/report.json` | 新增 | 测试与指标报告 |
-| 既有 `server.js` / `control-engine.js` / `plc-packet.js` / `src/**` | **未改动** | 避免影响在运行的服务；集成方式见第三节 |
+| `upgrade-routes.js` | 新增 | REST 入口（`/api/v2/*`），v2.1 起已由 `server.js` 默认挂载 |
+| `security.js` | 新增 | 写接口保护：令牌校验、按 IP 令牌桶限流、操作审计、上传扩展名白名单、安全响应头（零第三方依赖） |
+| `tests/run-tests.js`、`tests/report.json` | 新增 | 测试与指标报告（51 项） |
+| 既有 `server.js` / `control-engine.js` | **v2.1 起有改动** | `server.js` 挂载 `/api/v2`、接入 `security` 中间件与上传白名单；`control-engine.js` 增加增益上限校验。改动均为**增量**，未触碰采集、告警、控制主流程 |
+| 既有 `plc-packet.js` / `src/**` | 未改动 | 避免影响在运行的前端与协议解析 |
 
-## 三、集成方式（3 步，可回退）
+## 三、集成方式（v2.1 起已内置，无需手工改动）
 
-1. **挂载新接口**（`server.js` 顶部加 require，路由处加一行）：
+> v2.1 已在 `server.js` 中完成挂载，**开箱即用**。下列内容保留作回退与二次集成参考。
+
+1. **挂载新接口与安全中间件**（`server.js` 顶部 require，路由处挂载）：
    ```js
+   const security = require('./security');
    const createUpgradeRouter = require('./upgrade-routes');
+   const sec = security.createSecurity();
+   app.use(cors(sec.corsOptions()));
+   app.use(sec.middleware());                 // 写接口保护（默认不改变现网行为）
+   app.get('/api/v2/audit', sec.auditHandler());
+   app.get('/api/v2/security', (req, res) => res.json(sec.status()));
    app.use('/api/v2', createUpgradeRouter({ autoCreateOrder: true }));
    ```
+   **回退**：删除上述 4 行挂载即可回到 v1 行为（`security.js` / `upgrade-routes.js` 文件可保留）。
 2. **控制回路切换到 v2**（可选，先小范围验证）：在控制定时器内用
    `const { createControlEngineV2, tuneSafe, PRESETS } = require('./control-engine-v2');`
    将原 `control-engine` 的 `tick/setAuto` 调用替换为 v2 的 `tick/setAuto`，并按

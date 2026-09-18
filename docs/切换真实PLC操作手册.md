@@ -3,7 +3,7 @@
 ## —— 受电弓碳滑板监测平台：从模拟器闭环切换到现场汇川 H5U
 
 > 适用工程：`D:\realtime-platform\realtime-platform-main`
-> 手册版本：v1.0　编写日期：2026-09-18
+> 手册版本：v1.1　编写日期：2026-09-18
 > 配套文档：《平台使用操作手册》《PLC接入操作手册》《开发者二次开发指南》《平台技术与模型公式总结》
 > 适用对象：现场调试人员、平台管理员、驻站运维人员
 > 本手册中所标注"**本机实测**"的输出，均为在开发机（Windows + Node v26.3.0 + 汇川 H5U 协议模拟器）上实际运行得到的原始日志，未作修饰。
@@ -383,6 +383,24 @@ curl.exe -X POST http://localhost:3000/api/plc/mode -H "Content-Type: applicatio
 ### 6.3 停服顺序
 
 先停平台，再停模拟器/断开 PLC 连接，避免平台日志刷屏重连提示。
+
+### 6.4 启用了写接口令牌时，上面的命令怎么改
+
+v1.2 起平台内置写接口保护。若 `.env` 里设了 `API_TOKEN`（非空即启用），则**所有写操作**（POST/DELETE）
+都必须带令牌，本手册第 4、6 章的 `curl.exe -X POST ...` 命令需要补一个请求头：
+
+```powershell
+curl.exe -X POST http://localhost:3000/api/control/auto `
+  -H "Content-Type: application/json" -H "X-API-Token: 你的令牌" `
+  -d "{\"loop\":\"force\",\"enabled\":true}"
+```
+
+要点：
+
+- 只读的 GET（`/api/plc/mode`、`/api/plc/packet`、`/api/control/status` 等）**不需要令牌**，切换前核查不受影响。
+- 不带令牌的写请求会返回 **401**；请求过快会返回 **429**（响应头 `Retry-After` 给出等待秒数）。
+- 浏览器页面里的控制按钮同样会被拦，现场调试建议**临时清空 `API_TOKEN` 并重启平台**，投产前再由反向代理注入令牌。
+- 查看当前策略与审计：`curl.exe http://localhost:3000/api/v2/security`、`curl.exe http://localhost:3000/api/v2/audit`。
 
 ---
 

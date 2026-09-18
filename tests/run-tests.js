@@ -169,6 +169,92 @@ ok(d1 < d2 && d2 < d3 && d3 <= 8000 * 1.1, '重连退避递增且有上限', `${
     ok(wo.level === 'critical', '由严重告警自动生成同等级工单');
     report.sections.maintenance = { mttr: ms.mttr(), health: { normal: h1, abnormal: h2 }, auditEntries: ms.auditTrail(o.id).length };
 
+    /* ---------------- F. 写接口安全加固 ---------------- */
+    section('F 写接口安全加固（令牌/限流/审计/上传白名单/增益上限）');
+    const security = require('../security');
+
+    function mockRes() {
+        const res = {
+            statusCode: 200, headers: {}, body: null, _finished: false,
+            setHeader(k, v) { this.headers[k.toLowerCase()] = v; return this; },
+            status(c) { this.statusCode = c; return this; },
+            json(b) { this.body = b; this._emitFinish(); return this; },
+            _handlers: {},
+            on(ev, fn) { (this._handlers[ev] = this._handlers[ev] || []).push(fn); return this; },
+            _emitFinish() {
+                if (this._finished) return; // 与 Express 一致：finish 只触发一次
+                this._finished = true;
+                (this._handlers.finish || []).forEach((fn) => fn());
+            }
+        };
+        return res;
+    }
+    function mockReq(method, path, headers) {
+        return { method, url: path, originalUrl: path, headers: headers || {}, ip: '10.0.0.9', socket: {} };
+    }
+    function run(mw, method, path, headers) {
+        const req = mockReq(method, path, headers);
+        const res = mockRes();
+        let passed = false;
+        mw(req, res, () => { passed = true; });
+        if (passed) res._emitFinish(); // 模拟路由处理器返回、响应结束
+        return { req, res, passed };
+    }
+
+    // F1 令牌校验：未启用时放行，启用后无令牌 401、带令牌放行
+    const secOpen = security.createSecurity({ token: '' });
+    ok(run(secOpen.middleware(), 'POST', '/api/control/auto').passed === true, '未配置 API_TOKEN 时写接口保持放行（不破坏现网）');
+    const secTok = security.createSecurity({ token: 'S3cret-Token' });
+    const r401 = run(secTok.middleware(), 'POST', '/api/control/auto');
+    ok(r401.res.statusCode === 401 && r401.passed === false, '启用令牌后：无令牌写请求被拒 401');
+    ok(run(secTok.middleware(), 'POST', '/api/control/auto', { 'x-api-token': 'S3cret-Token' }).passed === true, '携带 X-API-Token 正确令牌后放行');
+    ok(run(secTok.middleware(), 'DELETE', '/api/warnings', { authorization: 'Bearer S3cret-Token' }).passed === true, 'Authorization: Bearer 形式同样识别');
+    ok(run(secTok.middleware(), 'POST', '/api/control/auto', { 'x-api-token': 'wrong' }).res.statusCode === 401, '错误令牌被拒 401');
+    ok(run(secTok.middleware(), 'GET', '/api/history').passed === true, '只读 GET 不受令牌与限流影响');
+
+    // F2 频率限制：容量 3/min 时第 4 次写请求 429
+    const secRl = security.createSecurity({ token: '', ratePerMin: 3 });
+    const mwRl = secRl.middleware();
+    const codes = [1, 2, 3, 4].map(() => run(mwRl, 'POST', '/api/alert').res.statusCode);
+    ok(codes.slice(0, 3).every((c) => c === 200) && codes[3] === 429, '令牌桶限流：超出配额返回 429', `序列 ${codes.join(',')}`);
+    const res429 = run(mwRl, 'POST', '/api/alert').res;
+    ok(Number(res429.headers['retry-after']) > 0, '429 响应带 Retry-After 头', `Retry-After=${res429.headers['retry-after']} s`);
+
+    // F3 审计：写操作留痕、只读不留痕
+    const secAudit = security.createSecurity({ token: '', ratePerMin: 100 });
+    const mwAudit = secAudit.middleware();
+    run(mwAudit, 'POST', '/api/control/auto');
+    run(mwAudit, 'POST', '/api/control/tune');
+    run(mwAudit, 'GET', '/api/plc/packet');
+    const stAudit = secAudit.status();
+    ok(stAudit.auditCount === 2, '审计只记录写操作（2 次写、1 次读 → 2 条）', `count=${stAudit.auditCount}`);
+
+    // F4 上传白名单
+    const secUp = security.createSecurity({});
+    const filt = secUp.uploadFilter();
+    let upOk = null, upBad = null;
+    filt({}, { originalname: 'photo.JPG' }, (e, v) => { upOk = e || v; });
+    filt({}, { originalname: 'evil.html' }, (e, v) => { upBad = e || v; });
+    ok(upOk === true, '上传白名单：.JPG 放行（大小写不敏感）');
+    ok(upBad instanceof Error, '上传白名单：.html 被拒', upBad && upBad.message);
+    let upSvg = null;
+    filt({}, { originalname: 'x.svg' }, (e, v) => { upSvg = e || v; });
+    ok(upSvg instanceof Error, '上传白名单：.svg 被拒（防脚本注入）');
+
+    // F5 控制增益上限
+    const eng = require('../control-engine').createControlEngine();
+    ok(eng.setParams('force', { kp: 1e6 }).ok === false, 'PID 增益上限：kp=1e6 被拒');
+    ok(eng.setParams('force', { kp: 2.4, ki: 1.2, kd: 1.2 }).ok === true, '正常工程参数仍可下发（kp=2.4）');
+    ok(eng.setParams('force', { target: 99999 }).ok === false, '目标值超可实现范围仍被拒');
+
+    report.sections.security = {
+        tokenGuard: { disabledPass: true, unauthorized401: true, bearerOk: true, wrongToken401: true },
+        rateLimit: { codes, retryAfterHeader: res429.headers['retry-after'] },
+        audit: stAudit,
+        upload: { jpg: 'allow', html: 'deny', svg: 'deny' },
+        gainLimit: { reject1e6: true, acceptNormal: true }
+    };
+
     /* ---------------- 汇总 ---------------- */
     const summary = { pass, fail, generatedAt: new Date().toISOString(), results: report.sections };
     fs.mkdirSync(__dirname, { recursive: true });

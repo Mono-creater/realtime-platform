@@ -14,13 +14,18 @@ const {
     anomaliesFromBitmap
 } = require('./plc-packet');
 const { createControlEngine } = require('./control-engine');
+const security = require('./security');
+const createUpgradeRouter = require('./upgrade-routes');
 
 // 自动加载 .env（Node >= 20.19；通过 --env-file 启动时已有变量不会被覆盖）
 try { process.loadEnvFile(); } catch { /* 无 .env 文件时忽略 */ }
 
+const sec = security.createSecurity();
+
 const app = express();
-app.use(cors());
+app.use(cors(sec.corsOptions()));
 app.use(express.json());
+app.use(sec.middleware()); // 写接口令牌校验 + 频率限制 + 操作审计（GET 只读一律放行）
 
 // ============================================================
 // 托管前端静态文件（Vue 构建产物）
@@ -554,15 +559,23 @@ const storage = multer.diskStorage({
 
 const upload = multer({
     storage,
-    limits: { fileSize: 50 * 1024 * 1024 }
+    limits: sec.uploadLimits(),
+    fileFilter: sec.uploadFilter() // 扩展名白名单，阻断 .html/.js/.svg 等可执行载荷
 });
 
-app.post('/api/upload', upload.single('file'), (req, res) => {
-    if (!req.file) {
-        return res.status(400).json({ error: '未上传文件' });
-    }
-    const url = `/uploads/${req.file.filename}`;
-    res.json({ url });
+app.post('/api/upload', (req, res) => {
+    upload.single('file')(req, res, (err) => {
+        if (err) {
+            const tooLarge = err.code === 'LIMIT_FILE_SIZE';
+            return res.status(tooLarge ? 413 : 400).json({
+                error: tooLarge ? '文件超出大小上限' : err.message
+            });
+        }
+        if (!req.file) {
+            return res.status(400).json({ error: '未上传文件' });
+        }
+        res.json({ url: `/uploads/${req.file.filename}` });
+    });
 });
 
 // ============================================================
@@ -1125,6 +1138,15 @@ app.delete('/api/simulation/clear', async (req, res) => {
 });
 
 // ============================================================
+// 4.5 v2 升级能力挂载（标准/告警引擎/链路监测/工单/健康/KPI）+ 安全审计
+// ============================================================
+app.get('/api/v2/audit', sec.auditHandler());
+app.get('/api/v2/security', (req, res) => res.json(sec.status()));
+app.use('/api/v2', createUpgradeRouter({
+    autoCreateOrder: String(process.env.AUTO_CREATE_ORDER || 'true').toLowerCase() !== 'false'
+}));
+
+// ============================================================
 // 5. 启动服务器
 // ============================================================
 const PORT = process.env.PORT || 3000;
@@ -1134,6 +1156,9 @@ const PORT = process.env.PORT || 3000;
         console.log(`✅ Server running on http://localhost:${PORT}`);
         console.log(`📡 WebSocket 服务已启动`);
         console.log(`📁 上传文件保存至: ${uploadDir}`);
+        const s = sec.status();
+        console.log(`🛡️ 写接口保护: 令牌校验${s.tokenEnabled ? '已启用' : '未启用（设置 API_TOKEN 可启用）'}，限流 ${s.rateLimitPerMin} 次/分/IP`);
+        console.log(`🔌 v2 升级接口已挂载: /api/v2（审计 /api/v2/audit，安全状态 /api/v2/security）`);
     });
 
     if (SIMULATION_MODE) {
