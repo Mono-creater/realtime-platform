@@ -40,6 +40,7 @@ if not exist ".env" (
   echo.
 )
 
+set /a EMPTYN=0
 :menu
 echo.
 echo ------------------------------------------------------------
@@ -50,7 +51,17 @@ echo   4. 只启动 PLC 模拟器（联调用）
 echo   5. 环境自检（Node / .env / 端口占用）
 echo   0. 退出
 echo ------------------------------------------------------------
+set "CHOICE="
 set /p CHOICE=请输入序号并回车:
+if not defined CHOICE (
+  set /a EMPTYN+=1
+  if !EMPTYN! GEQ 3 (
+    echo [提示] 未检测到输入，脚本退出。
+    exit /b 0
+  )
+  goto menu
+)
+set /a EMPTYN=0
 echo.
 
 if "%CHOICE%"=="1" goto run
