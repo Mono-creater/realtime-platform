@@ -5,6 +5,7 @@
   "scripts": {
     "start": "node server.js",
     "dev": "vite",
+    "dev:all": "run-p start dev",
     "build": "vite build",
     "preview": "vite preview",
     "lint": "run-s lint:*",
@@ -13,7 +14,8 @@
     "format": "oxfmt src/",
     "plc-sim": "node plc-simulator.js",
     "plc-sim:anomaly": "node plc-simulator.js --anomaly temperature:high",
-    "plc-sim:closedloop": "node plc-simulator.js --debug"
+    "plc-sim:closedloop": "node plc-simulator.js --debug",
+    "doctor": "powershell -NoProfile -ExecutionPolicy Bypass -File tools/plc-sim-doctor.ps1"
   },
   "dependencies": {
     "@element-plus/icons-vue": "^2.3.2",
