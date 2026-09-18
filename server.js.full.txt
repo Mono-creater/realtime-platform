@@ -1,0 +1,1148 @@
+Read "D:\realtime-platform\realtime-platform-main\server.js":
+
+     1	const express = require('express');
+     2	const http = require('http');
+     3	const { Server } = require('socket.io');
+     4	const cors = require('cors');
+     5	const ModbusRTU = require('modbus-serial');
+     6	const multer = require('multer');
+     7	const { v4: uuidv4 } = require('uuid');
+     8	const path = require('path');
+     9	const fs = require('fs');
+    10	const {
+    11	    THRESHOLDS,
+    12	    parseMainPacket,
+    13	    parseSubPacket,
+    14	    anomaliesFromBitmap
+    15	} = require('./plc-packet');
+    16	const { createControlEngine } = require('./control-engine');
+    17	
+    18	// 自动加载 .env（Node >= 20.19；通过 --env-file 启动时已有变量不会被覆盖）
+    19	try { process.loadEnvFile(); } catch { /* 无 .env 文件时忽略 */ }
+    20	
+    21	const app = express();
+    22	app.use(cors());
+    23	app.use(express.json());
+    24	
+    25	// ============================================================
+    26	// 托管前端静态文件（Vue 构建产物）
+    27	// ============================================================
+    28	app.use(express.static(path.join(__dirname, 'dist')));
+    29	
+    30	// ============================================================
+    31	// 根路径响应（返回 index.html）
+    32	// ============================================================
+    33	app.get('/', (req, res) => {
+    34	  res.sendFile(path.join(__dirname, 'dist', 'index.html'));
+    35	});
+    36	
+    37	const server = http.createServer(app);
+    38	const io = new Server(server, {
+    39	  cors: { origin: "*" },
+    40	});
+    41	
+    42	// ============================================================
+    43	// 检查是否为模拟模式
+    44	// ============================================================
+    45	// 运行时模式标志（运行中可能因 PLC 断连自动回退到模拟模式）
+    46	let SIMULATION_MODE = process.env.PLC_MODE === 'simulation';
+    47	
+    48	// 条件加载 Prisma
+    49	let prisma = null;
+    50	if (!SIMULATION_MODE) {
+    51	  try {
+    52	    const { PrismaClient } = require('@prisma/client');
+    53	    prisma = new PrismaClient();
+    54	    console.log('✅ Prisma Client 已初始化');
+    55	  } catch {
+    56	    console.warn('⚠️ Prisma 加载失败，将以无数据库模式运行');
+    57	  }
+    58	} else {
+    59	  console.log('🔄 模拟模式已启用，跳过数据库连接');
+    60	}
+    61	
+    62	// ============================================================
+    63	// 1. 原有业务逻辑（告警管理）
+    64	// ============================================================
+    65	// 2026-08-27 起清除内置模拟数据（原 6 条 2024 演示记录及饼图/统计初值）：
+    66	// 告警历史从空开始，真实数据由 PLC 告警或数据库加载（loadHistoryFromDB）提供
+    67	let currentWarningList = [];
+    68	
+    69	let currentOverLimit = [
+    70	  { title: '压力超限', count: 0 },
+    71	  { title: '导高超限', count: 0 },
+    72	  { title: '燃弧超限', count: 0 },
+    73	  { title: '拉出值超限', count: 0 },
+    74	];
+    75	
+    76	let currentPieData = {
+    77	  first: [],
+    78	  second: []
+    79	};
+    80	
+    81	function broadcastFullUpdate() {
+    82	  io.emit('fullUpdate', {
+    83	    warningList: currentWarningList || [],
+    84	    overLimit: currentOverLimit || [],
+    85	    pieData: currentPieData || {},
+    86	  });
+    87	}
+    88	
+    89	// ============================================================
+    90	// 内存告警列表公共操作（封顶 + 统计 + 唯一 ID）
+    91	// ============================================================
+    92	const MAX_MEMORY_WARNINGS = 500;
+    93	
+    94	function updateOverLimitStats() {
+    95	  const counts = {};
+    96	  currentWarningList.forEach(w => { counts[w.content] = (counts[w.content] || 0) + 1; });
+    97	  currentOverLimit = currentOverLimit.map(card => ({
+    98	    ...card,
+    99	    count: counts[card.title] || 0,
+   100	  }));
+   101	}
+   102	
+   103	function pushWarning(warning) {
+   104	  currentWarningList.push(warning);
+   105	  if (currentWarningList.length > MAX_MEMORY_WARNINGS) {
+   106	    currentWarningList.splice(0, currentWarningList.length - MAX_MEMORY_WARNINGS);
+   107	  }
+   108	}
+   109	
+   110	let memIdCounter = Date.now();
+   111	function nextMemId() { return ++memIdCounter; }
+   112	
+   113	async function loadHistoryFromDB() {
+   114	  if (!prisma) {
+   115	    console.log('ℹ️ 跳过数据库加载（模拟模式），使用内存数据');
+   116	    return;
+   117	  }
+   118	  try {
+   119	    const history = await prisma.warningHistory.findMany({
+   120	      orderBy: { time: 'desc' },
+   121	      take: MAX_MEMORY_WARNINGS,
+   122	    });
+   123	    if (history.length > 0) {
+   124	      currentWarningList = history.map(item => ({
+   125	        id: item.id,
+   126	        code: item.code,
+   127	        content: item.content,
+   128	        time: item.time.toISOString().slice(0,10),
+   129	        worker: item.worker || '',
+   130	        remark: item.remark || '/',
+   131	      }));
+   132	    } else {
+   133	      console.log('ℹ️ 数据库为空，告警历史从空开始');
+   134	    }
+   135	    updateOverLimitStats();
+   136	    console.log(`✅ 当前加载 ${currentWarningList.length} 条记录`);
+   137	  } catch (err) {
+   138	    console.error('❌ 加载历史数据失败，使用内存默认数据:', err);
+   139	  }
+   140	}
+   141	
+   142	// ---------- 环境类预警口径（温度/湿度） ----------
+   143	// 高温/低温/高湿由环境因素引起，不反映碳滑板自身状态：
+   144	// 1. 不计入碳滑板健康度扣分（/api/stats/summary 与前端 MonitorGlobal 保持同一口径）
+   145	// 2. 在故障总览与 PDF 报告的备注中写明具体成因，便于与环境预警和设备故障区分
+   146	const ENV_WARNING_CONTENTS = ['高温预警', '低温预警', '高湿预警'];
+   147	const ENV_WARNING_CAUSES = {
+   148	    '高温预警': '环境温度过高所致，属环境因素，非碳滑板部件故障；建议检查环境散热与空调',
+   149	    '低温预警': '环境温度过低所致，属环境因素，非碳滑板部件故障；低温下碳条变脆，建议关注取流状态',
+   150	    '高湿预警': '环境湿度过高所致，属环境因素，非碳滑板部件故障；高湿易加剧燃弧，建议加强除湿通风'
+   151	};
+   152	// 备注取值：环境类预警的历史数据可能是空、'/' 或 JSON 调试串，统一兜底为成因说明
+   153	function resolveEnvRemark(content, remark) {
+   154	    if (!ENV_WARNING_CONTENTS.includes(content)) return remark || '/';
+   155	    if (!remark || remark === '/' || remark.startsWith('{')) {
+   156	        return ENV_WARNING_CAUSES[content];
+   157	    }
+   158	    return remark;
+   159	}
+   160	
+   161	async function saveWarningToHistory(warning) {
+   162	  if (!prisma) {
+   163	    console.log('💾 模拟模式：保存警告到内存（不持久化）', warning);
+   164	    return { id: nextMemId() };
+   165	  }
+   166	  const created = await prisma.warningHistory.create({
+   167	    data: {
+   168	      code: warning.code,
+   169	      content: warning.content,
+   170	      time: new Date(warning.time),
+   171	      worker: warning.worker,
+   172	      remark: warning.remark,
+   173	    },
+   174	  });
+   175	  return created;
+   176	}
+   177	
+   178	// ---------- WebSocket 事件 ----------
+   179	io.on('connection', (socket) => {
+   180	  socket.emit('fullUpdate', {
+   181	    warningList: currentWarningList,
+   182	    overLimit: currentOverLimit,
+   183	    pieData: currentPieData,
+   184	  });
+   185	
+   186	  socket.on('addWarning', async (newWarning) => {
+   187	    try {
+   188	      if (!newWarning || typeof newWarning !== 'object' || Array.isArray(newWarning)) return;
+   189	      const created = await saveWarningToHistory(newWarning);
+   190	      const memWarning = {
+   191	        id: created.id,
+   192	        code: newWarning.code,
+   193	        content: newWarning.content,
+   194	        time: newWarning.time,
+   195	        worker: newWarning.worker || '',
+   196	        remark: resolveEnvRemark(newWarning.content, newWarning.remark),
+   197	      };
+   198	      pushWarning(memWarning);
+   199	      updateOverLimitStats();
+   200	      broadcastFullUpdate();
+   201	    } catch (err) {
+   202	      console.error('❌ addWarning 处理失败:', err.message);
+   203	    }
+   204	  });
+   205	
+   206	  socket.on('updatePie', (data) => {
+   207	    if (!data || typeof data !== 'object' || Array.isArray(data)) return;
+   208	    const tab = data.tab;
+   209	    if (typeof tab !== 'string' || ['__proto__', 'constructor', 'prototype'].includes(tab)) return;
+   210	    if (!data.data || typeof data.data !== 'object' || Array.isArray(data.data)) return;
+   211	    currentPieData[tab] = data.data;
+   212	    broadcastFullUpdate();
+   213	  });
+   214	});
+   215	
+   216	// ---------- HTTP API ----------
+   217	app.get('/api/test', async (req, res) => {
+   218	  if (!prisma) {
+   219	    return res.json({ count: currentWarningList.length });
+   220	  }
+   221	  const count = await prisma.warningHistory.count();
+   222	  res.json({ count });
+   223	});
+   224	
+   225	app.get('/api/stats/summary', async (req, res) => {
+   226	  try {
+   227	    let todayCount;
+   228	    let healthCount;
+   229	    if (prisma) {
+   230	      const today = new Date().toISOString().slice(0,10);
+   231	      const timeRange = { gte: new Date(today), lt: new Date(today + 'T23:59:59') };
+   232	      todayCount = await prisma.warningHistory.count({ where: { time: timeRange } });
+   233	      // 碳滑板健康度只统计设备类告警，环境类预警不扣减
+   234	      healthCount = await prisma.warningHistory.count({
+   235	        where: { time: timeRange, content: { notIn: ENV_WARNING_CONTENTS } }
+   236	      });
+   237	    } else {
+   238	      const today = new Date().toISOString().slice(0,10);
+   239	      todayCount = currentWarningList.filter(item => item.time && item.time.startsWith(today)).length;
+   240	      healthCount = currentWarningList.filter(item =>
+   241	        item.time && item.time.startsWith(today) && !ENV_WARNING_CONTENTS.includes(item.content)
+   242	      ).length;
+   243	    }
+   244	    let health;
+   245	    if (healthCount === 0) {
+   246	      health = 100;
+   247	    } else {
+   248	      health = Math.round(100 - healthCount * 0.5);
+   249	      health = Math.min(100, Math.max(0, health));
+   250	    }
+   251	    res.json({
+   252	      onlineVehicles: 128,
+   253	      todayAlarms: todayCount,
+   254	      handleRate: 94,
+   255	      health: health
+   256	    });
+   257	  } catch (err) {
+   258	    res.status(500).json({ error: err.message });
+   259	  }
+   260	});
+   261	
+   262	app.get('/api/stats/trend', async (req, res) => {
+   263	  const days = parseInt(req.query.days) || 7;
+   264	  const startDate = new Date();
+   265	  startDate.setDate(startDate.getDate() - days);
+   266	
+   267	  if (!prisma) {
+   268	    const dates = [];
+   269	    const counts = [];
+   270	    for (let i = days-1; i >= 0; i--) {
+   271	      const d = new Date();
+   272	      d.setDate(d.getDate() - i);
+   273	      const dateStr = d.toISOString().slice(0,10);
+   274	      dates.push(dateStr.slice(5));
+   275	      const count = currentWarningList.filter(item => item.time && item.time.startsWith(dateStr)).length;
+   276	      counts.push(count);
+   277	    }
+   278	    return res.json({ dates, counts });
+   279	  }
+   280	
+   281	  try {
+   282	    const results = await prisma.$queryRaw`
+   283	      SELECT DATE(time) as date, COUNT(*) as count
+   284	      FROM warning_history
+   285	      WHERE time >= ${startDate}
+   286	      GROUP BY DATE(time)
+   287	      ORDER BY date ASC
+   288	    `;
+   289	    const dates = results.map(r => r.date.toISOString().slice(5, 10));
+   290	    const counts = results.map(r => Number(r.count));
+   291	    res.json({ dates, counts });
+   292	  } catch (err) {
+   293	    res.status(500).json({ error: err.message });
+   294	  }
+   295	});
+   296	
+   297	app.get('/api/stats/distribution', async (req, res) => {
+   298	  if (!prisma) {
+   299	    const counts = {};
+   300	    currentWarningList.forEach(item => {
+   301	      counts[item.content] = (counts[item.content] || 0) + 1;
+   302	    });
+   303	    const data = Object.keys(counts).map(name => ({ name, value: counts[name] }));
+   304	    return res.json(data);
+   305	  }
+   306	  try {
+   307	    const results = await prisma.$queryRaw`
+   308	      SELECT content, COUNT(*) as count
+   309	      FROM warning_history
+   310	      GROUP BY content
+   311	    `;
+   312	    const data = results.map(r => ({ name: r.content, value: Number(r.count) }));
+   313	    res.json(data);
+   314	  } catch (err) {
+   315	    res.status(500).json({ error: err.message });
+   316	  }
+   317	});
+   318	
+   319	app.get('/api/history', async (req, res) => {
+   320	  const { start, end, content } = req.query;
+   321	  const rawLimit = parseInt(req.query.limit, 10);
+   322	  const limit = Number.isFinite(rawLimit) ? Math.min(Math.max(rawLimit, 1), 2000) : 500;
+   323	  const where = {};
+   324	  if (content) where.content = content;
+   325	  if (start || end) {
+   326	    where.time = {};
+   327	    if (start) where.time.gte = new Date(start);
+   328	    if (end) where.time.lte = new Date(end);
+   329	  }
+   330	
+   331	  if (!prisma) {
+   332	    let list = [...currentWarningList];
+   333	    if (content) list = list.filter(item => item.content === content);
+   334	    if (start) list = list.filter(item => item.time >= start);
+   335	    if (end) list = list.filter(item => item.time <= end);
+   336	    list.sort((a, b) => new Date(b.time) - new Date(a.time));
+   337	    return res.json(list.slice(0, limit));
+   338	  }
+   339	
+   340	  try {
+   341	    const history = await prisma.warningHistory.findMany({
+   342	      where,
+   343	      orderBy: { time: 'desc' },
+   344	      take: limit,
+   345	    });
+   346	    res.json(history);
+   347	  } catch (err) {
+   348	    res.status(500).json({ error: err.message });
+   349	  }
+   350	});
+   351	
+   352	app.post('/api/alert', async (req, res) => {
+   353	  try {
+   354	    const {
+   355	      timestamp, alarmType, level, value, code, worker,
+   356	      carNumber, line, station, direction, location, mileage, speed,
+   357	      imageUrl, videoUrl
+   358	    } = req.body;
+   359	
+   360	    const parsedTime = timestamp ? new Date(timestamp) : new Date();
+   361	    const time = isNaN(parsedTime.getTime()) ? new Date() : parsedTime;
+   362	
+   363	    const data = {
+   364	      code: code || 'UNKNOWN',
+   365	      content: alarmType || '未知告警',
+   366	      time,
+   367	      worker: worker || 'SYSTEM',
+   368	      // 环境类预警备注写明具体成因，其余告警仍记录图片地址
+   369	      remark: ENV_WARNING_CAUSES[alarmType] || (imageUrl || ''),
+   370	      level: level || '--',
+   371	      value: value || 0,
+   372	      carNumber: carNumber || '--',
+   373	      line: line || '--',
+   374	      station: station || '--',
+   375	      direction: direction || '--',
+   376	      location: location || '--',
+   377	      mileage: mileage || '--',
+   378	      speed: speed || 0,
+   379	      imageUrl: imageUrl || '',
+   380	      videoUrl: videoUrl || ''
+   381	    };
+   382	
+   383	    let created;
+   384	    if (prisma) {
+   385	      created = await prisma.warningHistory.create({ data });
+   386	    } else {
+   387	      created = { id: nextMemId() };
+   388	    }
+   389	
+   390	    const newWarning = {
+   391	      id: created.id,
+   392	      code: data.code,
+   393	      content: data.content,
+   394	      time: data.time.toISOString().slice(0, 10),
+   395	      worker: data.worker,
+   396	      remark: data.remark,
+   397	      level: data.level,
+   398	      value: data.value,
+   399	      carNumber: data.carNumber,
+   400	      line: data.line,
+   401	      station: data.station,
+   402	      direction: data.direction,
+   403	      location: data.location,
+   404	      mileage: data.mileage,
+   405	      speed: data.speed,
+   406	      imageUrl: data.imageUrl,
+   407	      videoUrl: data.videoUrl
+   408	    };
+   409	
+   410	    pushWarning(newWarning);
+   411	    updateOverLimitStats();
+   412	    broadcastFullUpdate();
+   413	    res.json({ success: true, id: created.id });
+   414	  } catch (err) {
+   415	    console.error('告警接收失败:', err);
+   416	    res.status(500).json({ error: err.message });
+   417	  }
+   418	});
+   419	
+   420	app.get('/api/warning/:id', async (req, res) => {
+   421	  const { id } = req.params;
+   422	  const numericId = Number(id);
+   423	  if (isNaN(numericId)) {
+   424	    return res.status(400).json({ error: '无效的ID' });
+   425	  }
+   426	
+   427	  if (!prisma) {
+   428	    const warning = currentWarningList.find(w => w.id === numericId);
+   429	    if (!warning) {
+   430	      return res.status(404).json({ error: '记录不存在' });
+   431	    }
+   432	    return res.json(warning);
+   433	  }
+   434	
+   435	  try {
+   436	    const warning = await prisma.warningHistory.findUnique({
+   437	      where: { id: numericId }
+   438	    });
+   439	    if (!warning) {
+   440	      return res.status(404).json({ error: '记录不存在' });
+   441	    }
+   442	    const result = {
+   443	      ...warning,
+   444	      time: warning.time.toISOString().slice(0, 10),
+   445	      createdAt: warning.createdAt.toISOString()
+   446	    };
+   447	    res.json(result);
+   448	  } catch (err) {
+   449	    res.status(500).json({ error: err.message });
+   450	  }
+   451	});
+   452	
+   453	app.delete('/api/warning/:id', async (req, res) => {
+   454	  const { id } = req.params;
+   455	  const numericId = Number(id);
+   456	  if (isNaN(numericId)) {
+   457	    return res.status(400).json({ error: '无效的 ID' });
+   458	  }
+   459	
+   460	  try {
+   461	    console.log(`🔍 尝试删除 ID: ${numericId}`);
+   462	
+   463	    const index = currentWarningList.findIndex(w => Number(w.id) === numericId);
+   464	    if (index !== -1) {
+   465	      currentWarningList.splice(index, 1);
+   466	      console.log(`✅ 内存移除成功，剩余 ${currentWarningList.length} 条`);
+   467	    } else {
+   468	      console.warn(`⚠️ 内存中未找到 ID ${numericId}`);
+   469	    }
+   470	
+   471	    if (prisma) {
+   472	      try {
+   473	        await prisma.warningHistory.delete({
+   474	          where: { id: numericId },
+   475	        });
+   476	        console.log(`✅ 数据库删除成功, ID: ${numericId}`);
+   477	      } catch (dbErr) {
+   478	        if (dbErr.code === 'P2025') {
+   479	          console.log(`ℹ️ 数据库中不存在 ID ${numericId}，跳过数据库删除`);
+   480	        } else {
+   481	          throw dbErr;
+   482	        }
+   483	      }
+   484	    }
+   485	
+   486	    updateOverLimitStats();
+   487	    broadcastFullUpdate();
+   488	
+   489	    res.json({ success: true, message: '记录已删除' });
+   490	  } catch (err) {
+   491	    console.error('❌ 删除失败详情:', err);
+   492	    console.error(err.stack);
+   493	    res.status(500).json({ error: err.message || '删除失败，请查看后端日志' });
+   494	  }
+   495	});
+   496	
+   497	// 批量删除故障记录（故障总览勾选删除）
+   498	app.delete('/api/warnings', async (req, res) => {
+   499	  const { ids } = req.body || {};
+   500	  if (!Array.isArray(ids) || ids.length === 0) {
+   501	    return res.status(400).json({ error: 'ids 必须是非空数组' });
+   502	  }
+   503	  const numericIds = [...new Set(ids.map(Number).filter(n => Number.isFinite(n)))];
+   504	  if (numericIds.length === 0) {
+   505	    return res.status(400).json({ error: 'ids 中没有有效数字' });
+   506	  }
+   507	
+   508	  // 内存列表同步删除（无数据库模式下的数据源）
+   509	  const idSet = new Set(numericIds);
+   510	  const before = currentWarningList.length;
+   511	  currentWarningList = currentWarningList.filter(w => !idSet.has(Number(w.id)));
+   512	  const deletedMem = before - currentWarningList.length;
+   513	
+   514	  // 数据库删除（deleteMany 对不存在的记录不报错）
+   515	  let deletedDb = 0;
+   516	  if (prisma) {
+   517	    try {
+   518	      const result = await prisma.warningHistory.deleteMany({
+   519	        where: { id: { in: numericIds } },
+   520	      });
+   521	      deletedDb = result.count;
+   522	    } catch (dbErr) {
+   523	      console.error('❌ 批量删除数据库记录失败:', dbErr.message);
+   524	      return res.status(500).json({ error: dbErr.message });
+   525	    }
+   526	  }
+   527	
+   528	  updateOverLimitStats();
+   529	  broadcastFullUpdate();
+   530	  const deleted = prisma ? deletedDb : deletedMem;
+   531	  console.log(`🗑️ 批量删除故障记录: ${deleted} 条 (请求 ${numericIds.length} 条)`);
+   532	  res.json({ deleted, ids: numericIds });
+   533	});
+   534	
+   535	// ============================================================
+   536	// 2. 文件上传模块
+   537	// ============================================================
+   538	const uploadDir = path.join(__dirname, 'uploads');
+   539	if (!fs.existsSync(uploadDir)) {
+   540	    fs.mkdirSync(uploadDir, { recursive: true });
+   541	    console.log(`📁 已创建上传目录: ${uploadDir}`);
+   542	}
+   543	
+   544	const storage = multer.diskStorage({
+   545	    destination: (req, file, cb) => {
+   546	        cb(null, uploadDir);
+   547	    },
+   548	    filename: (req, file, cb) => {
+   549	        const ext = path.extname(file.originalname);
+   550	        const filename = `${uuidv4()}${ext}`;
+   551	        cb(null, filename);
+   552	    }
+   553	});
+   554	
+   555	const upload = multer({
+   556	    storage,
+   557	    limits: { fileSize: 50 * 1024 * 1024 }
+   558	});
+   559	
+   560	app.post('/api/upload', upload.single('file'), (req, res) => {
+   561	    if (!req.file) {
+   562	        return res.status(400).json({ error: '未上传文件' });
+   563	    }
+   564	    const url = `/uploads/${req.file.filename}`;
+   565	    res.json({ url });
+   566	});
+   567	
+   568	// ============================================================
+   569	// PDF 导出：导出指定故障报告
+   570	// ============================================================
+   571	const PDFDocument = require('pdfkit');
+   572	const PDF_FONT_PATH = path.join(__dirname, 'src', 'assets', 'fonts', 'FZYTJW.TTF');
+   573	
+   574	function formatPdfTime(t) {
+   575	    if (typeof t !== 'string') return '--';
+   576	    const d = new Date(t);
+   577	    return isNaN(d.getTime()) ? t : d.toLocaleString('zh-CN', { hour12: false });
+   578	}
+   579	
+   580	app.get('/api/export/pdf/:id', async (req, res) => {
+   581	    const numericId = Number(req.params.id);
+   582	    if (isNaN(numericId)) {
+   583	        return res.status(400).json({ error: '无效的ID' });
+   584	    }
+   585	
+   586	    // 查找故障记录（内存或数据库）
+   587	    let warning;
+   588	    if (prisma) {
+   589	        try {
+   590	            warning = await prisma.warningHistory.findUnique({ where: { id: numericId } });
+   591	        } catch (err) {
+   592	            return res.status(500).json({ error: err.message });
+   593	        }
+   594	        if (warning) {
+   595	            warning = { ...warning, time: warning.time.toISOString().slice(0, 10) };
+   596	        }
+   597	    } else {
+   598	        warning = currentWarningList.find(w => Number(w.id) === numericId);
+   599	    }
+   600	    if (!warning) {
+   601	        return res.status(404).json({ error: '记录不存在' });
+   602	    }
+   603	
+   604	    try {
+   605	        const doc = new PDFDocument({ size: 'A4', margins: { top: 40, bottom: 40, left: 50, right: 50 } });
+   606	        res.setHeader('Content-Type', 'application/pdf');
+   607	        res.setHeader('Content-Disposition', `attachment; filename="fault-${numericId}.pdf"`);
+   608	        doc.registerFont('FZYTJW', PDF_FONT_PATH);
+   609	        doc.pipe(res);
+   610	
+   611	        // 标题栏
+   612	        doc.rect(0, 0, doc.page.width, 90).fill('#0a2e5d');
+   613	        doc.font('FZYTJW').fontSize(24).fillColor('#ffffff')
+   614	            .text('故障报告', 0, 30, { align: 'center' });
+   615	        doc.fontSize(10)
+   616	            .text(`生成时间：${new Date().toLocaleString('zh-CN')}`, 0, 62, { align: 'center' });
+   617	
+   618	        // 字段列表（基础字段 + 相机告警扩展字段）
+   619	        const fields = [
+   620	            ['故障编号', warning.code],
+   621	            ['故障类型', warning.content],
+   622	            ['预警时间', formatPdfTime(warning.time)],
+   623	            ['维修工号', warning.worker],
+   624	            ...(warning.level ? [['告警级别', warning.level]] : []),
+   625	            ...(warning.value !== undefined && warning.value !== null ? [['数值', String(warning.value)]] : []),
+   626	            ...(warning.carNumber ? [['车号', warning.carNumber]] : []),
+   627	            ...(warning.line ? [['线路', warning.line]] : []),
+   628	            ...(warning.station ? [['车站', warning.station]] : []),
+   629	            ...(warning.direction ? [['方向', warning.direction]] : []),
+   630	            ...(warning.location ? [['位置', warning.location]] : []),
+   631	            ...(warning.mileage ? [['里程', warning.mileage]] : []),
+   632	            ...(warning.speed !== undefined && warning.speed !== null ? [['速度', String(warning.speed)]] : []),
+   633	            ['备注', resolveEnvRemark(warning.content, warning.remark)],
+   634	        ];
+   635	
+   636	        let y = 130;
+   637	        for (const [label, value] of fields) {
+   638	            doc.font('FZYTJW').fontSize(11).fillColor('#0a2e5d')
+   639	                .text(label, 60, y, { width: 100 });
+   640	            doc.fillColor('#333333')
+   641	                .text(String(value ?? '--'), 180, y, { width: 370 });
+   642	            y += 28;
+   643	            doc.moveTo(60, y - 8).lineTo(doc.page.width - 60, y - 8)
+   644	                .lineWidth(0.5).strokeColor('#c9d8ea').stroke();
+   645	        }
+   646	
+   647	        doc.end();
+   648	    } catch (err) {
+   649	        console.error('❌ PDF 生成失败:', err);
+   650	        res.status(500).json({ error: 'PDF 生成失败' });
+   651	    }
+   652	});
+   653	
+   654	app.use('/uploads', express.static(uploadDir));
+   655	
+   656	// ============================================================
+   657	// 3. 数据采集模块（支持真实PLC和模拟模式）
+   658	// ============================================================
+   659	const PLC_CONFIG = {
+   660	    host: process.env.PLC_HOST || '192.168.1.88',
+   661	    port: parseInt(process.env.PLC_PORT) || 502,
+   662	    unitId: parseInt(process.env.PLC_UNIT_ID) || 1,
+   663	    registers: {
+   664	        temperature: parseInt(process.env.PLC_REG_TEMP) || 30001,
+   665	        pressure: parseInt(process.env.PLC_REG_PRESS) || 30002,
+   666	        humidity: parseInt(process.env.PLC_REG_HUMID) || 30003,
+   667	        status: parseInt(process.env.PLC_REG_STATUS) || 30004,
+   668	        seq: parseInt(process.env.PLC_REG_SEQ) || 30005,
+   669	        subBase: parseInt(process.env.PLC_REG_SUB_BASE) || 30011,
+   670	        writeForce: parseInt(process.env.PLC_REG_WRITE_FORCE) || 30021,
+   671	        writeHeight: parseInt(process.env.PLC_REG_WRITE_HEIGHT) || 30022
+   672	    },
+   673	    readInterval: parseInt(process.env.PLC_INTERVAL) || 2000,
+   674	    windowSize: parseInt(process.env.PLC_WINDOW) || 10
+   675	};
+   676	
+   677	let plcClient = null;
+   678	let sensorBuffer = [];
+   679	let isPLCConnecting = false;
+   680	let realInterval = null;
+   681	let simulationInterval = null;
+   682	let isSimulationPaused = false;
+   683	
+   684	// PLC 重连退避（失败后 2s 起步，翻倍至 30s 封顶）
+   685	const PLC_RECONNECT_INITIAL_MS = 2000;
+   686	const PLC_RECONNECT_MAX_MS = 30000;
+   687	let plcReconnectDelay = PLC_RECONNECT_INITIAL_MS;
+   688	let plcRetryAt = 0;
+   689	
+   690	// ---------- 故障分析逻辑（阈值单一来源：plc-packet.js THRESHOLDS） ----------
+   691	function analyzeFault(data) {
+   692	    const faults = [];
+   693	    if (data.temperature > THRESHOLDS.tempHigh) {
+   694	        faults.push({
+   695	            type: '高温预警',
+   696	            level: 'warning',
+   697	            value: data.temperature,
+   698	            detail: `均值温度 ${data.temperature}°C > ${THRESHOLDS.tempHigh}°C`
+   699	        });
+   700	    } else if (data.temperature < THRESHOLDS.tempLow) {
+   701	        faults.push({
+   702	            type: '低温预警',
+   703	            level: 'warning',
+   704	            value: data.temperature,
+   705	            detail: `均值温度 ${data.temperature}°C < ${THRESHOLDS.tempLow}°C`
+   706	        });
+   707	    }
+   708	    if (data.pressure > THRESHOLDS.pressHigh) {
+   709	        faults.push({
+   710	            type: '高压报警',
+   711	            level: 'error',
+   712	            value: data.pressure,
+   713	            detail: `均值压力 ${data.pressure}kPa > ${THRESHOLDS.pressHigh}kPa`
+   714	        });
+   715	    } else if (data.pressure < THRESHOLDS.pressLow) {
+   716	        faults.push({
+   717	            type: '低压报警',
+   718	            level: 'error',
+   719	            value: data.pressure,
+   720	            detail: `均值压力 ${data.pressure}kPa < ${THRESHOLDS.pressLow}kPa`
+   721	        });
+   722	    }
+   723	    if (data.humidity > THRESHOLDS.humidHigh) {
+   724	        faults.push({
+   725	            type: '高湿预警',
+   726	            level: 'warning',
+   727	            value: data.humidity,
+   728	            detail: `均值湿度 ${data.humidity}% > ${THRESHOLDS.humidHigh}%`
+   729	        });
+   730	    }
+   731	    return faults;
+   732	}
+   733	
+   734	function broadcastSensorData(avg, faults, extra = {}) {
+   735	    const payload = {
+   736	        timestamp: new Date().toISOString(),
+   737	        temperature: avg.temperature,
+   738	        pressure: avg.pressure,
+   739	        humidity: avg.humidity,
+   740	        faults: faults,
+   741	        type: faults.length > 0 ? 'alarm' : 'normal',
+   742	        // 扩展字段：数据源 / 异常子包 / 原始报文 / 控制状态
+   743	        source: extra.source || 'simulation',
+   744	        anomalies: extra.anomalies || faults,
+   745	        packet: extra.packet || null,
+   746	        control: extra.control || (controlEngine ? controlEngine.getStatus() : null)
+   747	    };
+   748	    io.emit('sensorData', payload);
+   749	    return payload;
+   750	}
+   751	
+   752	// 告警去重：同类型 10s 内且数值变化 <5% 不重复入库（防 2s 轮询刷屏）
+   753	const lastAlarmAt = {};
+   754	
+   755	async function handleAlarm(faults, avg) {
+   756	    for (const fault of faults) {
+   757	        const prev = lastAlarmAt[fault.type];
+   758	        const value = Number(fault.value) || 0;
+   759	        if (prev && Date.now() - prev.time < 10000
+   760	            && Math.abs(prev.value - value) <= Math.max(5, Math.abs(prev.value) * 0.05)) {
+   761	            continue; // 重复告警，跳过
+   762	        }
+   763	        lastAlarmAt[fault.type] = { time: Date.now(), value: value };
+   764	        const warning = {
+   765	            code: 'PLC_SENSOR',
+   766	            content: fault.type,
+   767	            time: new Date().toISOString(),
+   768	            worker: 'PLC_AUTO',
+   769	            // 环境类预警备注写明具体成因（含触发数据），其余类型保留调试 JSON
+   770	            remark: ENV_WARNING_CAUSES[fault.type]
+   771	                ? `${ENV_WARNING_CAUSES[fault.type]}；触发数据：${fault.detail}`
+   772	                : JSON.stringify({
+   773	                    avg: avg,
+   774	                    faults: faults,
+   775	                    timestamp: new Date().toISOString()
+   776	                })
+   777	        };
+   778	        const created = await saveWarningToHistory(warning);
+   779	        const memWarning = {
+   780	            id: created.id,
+   781	            code: warning.code,
+   782	            content: warning.content,
+   783	            time: warning.time,
+   784	            worker: warning.worker,
+   785	            remark: warning.remark
+   786	        };
+   787	        pushWarning(memWarning);
+   788	    }
+   789	
+   790	    updateOverLimitStats();
+   791	    broadcastFullUpdate();
+   792	}
+   793	
+   794	// ---------- Modbus 请求互斥锁（FC03 读 / FC16 写串行化） ----------
+   795	let modbusChain = Promise.resolve();
+   796	function modbusEnqueue(fn) {
+   797	    const p = modbusChain.then(fn, fn);
+   798	    modbusChain = p.catch(() => {});
+   799	    return p;
+   800	}
+   801	
+   802	// ---------- 控制引擎（双环 PID + Z-N 整定） ----------
+   803	const controlEngine = createControlEngine();
+   804	let latestSensor = null;        // 最近一次传感器均值（喂给控制引擎）
+   805	let lastPacket = null;          // 最近一次原始报文（/api/plc/packet 调试用）
+   806	let controlLoopInterval = null;
+   807	let lastWrittenForce = null;    // 写回去重
+   808	let lastWrittenHeight = null;
+   809	let lastWriteAt = 0;            // 最近写回时间：输出不变时每 5s 保活重写（ZN 整定期间输出恒定，防止 PLC 侧写回看门狗/模拟器漂移）
+   810	
+   811	function startControlLoop() {
+   812	    if (controlLoopInterval) return;
+   813	    controlLoopInterval = setInterval(() => {
+   814	        const mode = SIMULATION_MODE ? 'simulation' : 'plc';
+   815	        controlEngine.tick(latestSensor, mode);
+   816	
+   817	        // 写回：自动调节或整定中的回路，输出变化时 FC16 写 30021/30022；
+   818	        // 输出不变则每 5s 保活重写一次（整定阶跃期间输出恒定，防止 PLC 侧看门狗判超时）
+   819	        if (!SIMULATION_MODE && plcClient) {
+   820	            const st = controlEngine.getStatus();
+   821	            const tuning = st.tune && st.tune.state === 'sampling';
+   822	            const forceActive = st.loops.force.auto || (tuning && st.tune.loop === 'force');
+   823	            const postureActive = st.loops.posture.auto || (tuning && st.tune.loop === 'posture');
+   824	            const forceRaw = Math.round(Math.min(1000, Math.max(50, st.loops.force.output)) * 10); // 压力寄存器 ×10（1000kPa→10000，uint16 安全）
+   825	            const heightRaw = Math.round(Math.min(2600, Math.max(1000, st.loops.posture.output)));
+   826	            const anyActive = forceActive || postureActive;
+   827	            const forceChanged = forceRaw !== lastWrittenForce;
+   828	            const heightChanged = heightRaw !== lastWrittenHeight;
+   829	            const keepAlive = anyActive && Date.now() - lastWriteAt > 5000;
+   830	            if (anyActive && (forceChanged || heightChanged || keepAlive)) {
+   831	                if (forceChanged) lastWrittenForce = forceRaw;
+   832	                if (heightChanged) lastWrittenHeight = heightRaw;
+   833	                lastWriteAt = Date.now();
+   834	                modbusEnqueue(() => plcClient.writeRegisters(
+   835	                    PLC_CONFIG.registers.writeForce, [forceRaw, heightRaw]))
+   836	                    .catch((err) => console.error('⚠️ 写回 PLC 失败（不影响采集）:', err.message));
+   837	            }
+   838	        }
+   839	    }, controlEngine.config.controlInterval);
+   840	}
+   841	
+   842	// ---------- 真实PLC采集 ----------
+   843	async function connectPLC() {
+   844	    if (isPLCConnecting) return null;
+   845	    isPLCConnecting = true;
+   846	    try {
+   847	        const client = new ModbusRTU();
+   848	        await client.connectTCP(PLC_CONFIG.host, { port: PLC_CONFIG.port });
+   849	        client.setID(PLC_CONFIG.unitId);
+   850	        console.log(`✅ 汇川 PLC 连接成功 (${PLC_CONFIG.host}:${PLC_CONFIG.port})`);
+   851	        isPLCConnecting = false;
+   852	        return client;
+   853	    } catch (err) {
+   854	        console.error(`❌ 汇川 PLC 连接失败 (${err.message})`);
+   855	        isPLCConnecting = false;
+   856	        return null;
+   857	    }
+   858	}
+   859	
+   860	async function readAndBufferSensorData() {
+   861	    if (!plcClient) {
+   862	        if (Date.now() < plcRetryAt) return; // 退避等待中，跳过本次重连
+   863	        plcClient = await connectPLC();
+   864	        if (!plcClient) {
+   865	            plcReconnectDelay = Math.min(plcReconnectDelay * 2, PLC_RECONNECT_MAX_MS);
+   866	            plcRetryAt = Date.now() + plcReconnectDelay;
+   867	            console.warn(`⚠️ PLC 连接失败，${(plcReconnectDelay / 1000).toFixed(0)}s 后重试`);
+   868	            return;
+   869	        }
+   870	    }
+   871	
+   872	    try {
+   873	        // 主包：30001-30005（地址连续，一次批量读取）
+   874	        const regs = await modbusEnqueue(() =>
+   875	            plcClient.readHoldingRegisters(PLC_CONFIG.registers.temperature, 5)
+   876	                .then((r) => r.data));
+   877	        const packet = parseMainPacket(regs);
+   878	        plcReconnectDelay = PLC_RECONNECT_INITIAL_MS; // 读取成功，重置退避
+   879	
+   880	        if (packet.extended) {
+   881	            // ===== 新固件扩展协议：直接用 PLC 侧 10 条均值，不再二次平均 =====
+   882	            const avg = {
+   883	                temperature: Math.round(packet.temperature * 10) / 10,
+   884	                pressure: Math.round(packet.pressure * 100) / 100,
+   885	                humidity: Math.round(packet.humidity * 10) / 10
+   886	            };
+   887	            latestSensor = avg;
+   888	
+   889	            let sub = null;
+   890	            let faults = [];
+   891	            if (packet.subValid) {
+   892	                const subRegs = await modbusEnqueue(() =>
+   893	                    plcClient.readHoldingRegisters(PLC_CONFIG.registers.subBase, 5)
+   894	                        .then((r) => r.data));
+   895	                sub = parseSubPacket(subRegs);
+   896	                faults = anomaliesFromBitmap(sub.bitmap || packet.anomalyBitmap, sub.values);
+   897	            } else if (packet.anomalyBitmap) {
+   898	                faults = anomaliesFromBitmap(packet.anomalyBitmap, {
+   899	                    temperature: packet.temperature,
+   900	                    pressure: packet.pressure,
+   901	                    humidity: packet.humidity
+   902	                });
+   903	            }
+   904	            lastPacket = { source: 'plc', main: packet, sub, receivedAt: Date.now() };
+   905	            broadcastSensorData(avg, faults, {
+   906	                source: 'plc', anomalies: faults, packet: lastPacket
+   907	            });
+   908	            if (faults.length > 0) {
+   909	                await handleAlarm(faults, avg);
+   910	                console.log(`🚨 [PLC] seq=${packet.seq} 检测到 ${faults.length} 个异常（子包序号=${sub ? sub.subSeq : '-'}）`);
+   911	            }
+   912	        } else {
+   913	            // ===== 旧固件回退：平台侧 10 条缓冲均值 =====
+   914	            const record = {
+   915	                timestamp: Date.now(),
+   916	                temperature: Math.round(packet.temperature * 10) / 10,
+   917	                pressure: Math.round(packet.pressure * 100) / 100,
+   918	                humidity: Math.round(packet.humidity * 10) / 10
+   919	            };
+   920	            sensorBuffer.push(record);
+   921	            if (sensorBuffer.length >= PLC_CONFIG.windowSize) {
+   922	                await processBuffer();
+   923	            }
+   924	        }
+   925	    } catch (err) {
+   926	        console.error('❌ 读取传感器数据失败:', err.message);
+   927	        plcClient = null;
+   928	        plcReconnectDelay = Math.min(plcReconnectDelay * 2, PLC_RECONNECT_MAX_MS);
+   929	        plcRetryAt = Date.now() + plcReconnectDelay;
+   930	    }
+   931	}
+   932	
+   933	async function processBuffer() {
+   934	    if (sensorBuffer.length === 0) return;
+   935	    const sum = sensorBuffer.reduce((acc, cur) => {
+   936	        acc.temp += cur.temperature;
+   937	        acc.press += cur.pressure;
+   938	        acc.humid += cur.humidity;
+   939	        return acc;
+   940	    }, { temp: 0, press: 0, humid: 0 });
+   941	    const count = sensorBuffer.length;
+   942	    const avg = {
+   943	        temperature: Math.round((sum.temp / count) * 10) / 10,
+   944	        pressure: Math.round((sum.press / count) * 100) / 100,
+   945	        humidity: Math.round((sum.humid / count) * 10) / 10
+   946	    };
+   947	    latestSensor = avg;
+   948	    const faults = analyzeFault(avg);
+   949	    broadcastSensorData(avg, faults, { source: 'fallback' });
+   950	    if (faults.length > 0) {
+   951	        await handleAlarm(faults, avg);
+   952	        console.log(`🚨 [旧固件回退] 检测到 ${faults.length} 个故障`);
+   953	    }
+   954	    sensorBuffer = [];
+   955	}
+   956	
+   957	function startSimulation() {
+   958	    if (simulationInterval) return;
+   959	    if (realInterval) {
+   960	        clearInterval(realInterval);
+   961	        realInterval = null;
+   962	    }
+   963	    console.log('🔄 模拟模式已启动，将生成随机传感器数据');
+   964	    simulationInterval = setInterval(() => {
+   965	        if (isSimulationPaused) return;
+   966	        let temp = Math.round((20 + Math.random() * 70) * 10) / 10;
+   967	        let pressure = Math.round((50 + Math.random() * 1150) * 100) / 100;
+   968	        let humidity = Math.round((20 + Math.random() * 75) * 10) / 10;
+   969	
+   970	        if (Math.random() < 0.3) {
+   971	            const choice = Math.floor(Math.random() * 3);
+   972	            if (choice === 0) temp = 80 + Math.random() * 20;
+   973	            else if (choice === 1) pressure = 1000 + Math.random() * 300;
+   974	            else humidity = 85 + Math.random() * 15;
+   975	        }
+   976	
+   977	        const avg = {
+   978	            temperature: Math.round(temp * 10) / 10,
+   979	            pressure: Math.round(pressure * 100) / 100,
+   980	            humidity: Math.round(humidity * 10) / 10
+   981	        };
+   982	        latestSensor = avg;
+   983	        const faults = analyzeFault(avg);
+   984	        broadcastSensorData(avg, faults, { source: 'simulation' });
+   985	        if (faults.length > 0) {
+   986	            handleAlarm(faults, avg).catch(console.error);
+   987	            console.log(`🚨 [模拟] 检测到 ${faults.length} 个故障`);
+   988	        }
+   989	    }, PLC_CONFIG.readInterval);
+   990	}
+   991	
+   992	async function startRealCollection() {
+   993	    if (simulationInterval) {
+   994	        clearInterval(simulationInterval);
+   995	        simulationInterval = null;
+   996	    }
+   997	    isSimulationPaused = false;
+   998	    plcClient = await connectPLC();
+   999	    if (plcClient) {
+  1000	        SIMULATION_MODE = false;
+  1001	        realInterval = setInterval(readAndBufferSensorData, PLC_CONFIG.readInterval);
+  1002	        setTimeout(readAndBufferSensorData, 500);
+  1003	        console.log('✅ 切换到真实PLC模式');
+  1004	    } else {
+  1005	        console.warn('⚠️ 真实PLC连接失败，自动切换到模拟模式');
+  1006	        SIMULATION_MODE = true;
+  1007	        startSimulation();
+  1008	    }
+  1009	}
+  1010	
+  1011	// ---------- API：查询和切换模式 ----------
+  1012	app.get('/api/plc/mode', (req, res) => {
+  1013	    res.json({ mode: SIMULATION_MODE ? 'simulation' : 'real' });
+  1014	});
+  1015	
+  1016	app.post('/api/plc/mode', async (req, res) => {
+  1017	    const { mode } = req.body;
+  1018	    if (mode !== 'simulation' && mode !== 'real') {
+  1019	        return res.status(400).json({ error: '模式必须是 simulation 或 real' });
+  1020	    }
+  1021	    if ((mode === 'simulation' && SIMULATION_MODE) || (mode === 'real' && !SIMULATION_MODE)) {
+  1022	        return res.json({ mode: mode, message: '已经是该模式' });
+  1023	    }
+  1024	
+  1025	    if (mode === 'simulation') {
+  1026	        SIMULATION_MODE = true;
+  1027	        if (realInterval) {
+  1028	            clearInterval(realInterval);
+  1029	            realInterval = null;
+  1030	        }
+  1031	        plcClient = null;
+  1032	        sensorBuffer = [];
+  1033	        startSimulation();
+  1034	    } else {
+  1035	        SIMULATION_MODE = false;
+  1036	        if (simulationInterval) {
+  1037	            clearInterval(simulationInterval);
+  1038	            simulationInterval = null;
+  1039	        }
+  1040	        plcClient = null;
+  1041	        sensorBuffer = [];
+  1042	        await startRealCollection();
+  1043	    }
+  1044	    res.json({ mode: mode, message: `已切换到 ${mode} 模式` });
+  1045	});
+  1046	
+  1047	app.get('/api/simulation/pause', (req, res) => {
+  1048	    res.json({ paused: isSimulationPaused });
+  1049	});
+  1050	
+  1051	app.post('/api/simulation/pause', (req, res) => {
+  1052	    const body = req.body;
+  1053	    if (body && typeof body.paused === 'boolean') {
+  1054	        isSimulationPaused = body.paused;
+  1055	    } else {
+  1056	        isSimulationPaused = !isSimulationPaused; // 兼容旧调用：无 body 时切换
+  1057	    }
+  1058	    console.log(`⏸️ 模拟数据${isSimulationPaused ? '已暂停' : '已恢复'}`);
+  1059	    res.json({ paused: isSimulationPaused });
+  1060	});
+  1061	
+  1062	// ---------- API：PLC 报文与控制引擎 ----------
+  1063	app.get('/api/plc/packet', (req, res) => {
+  1064	    res.json(lastPacket || { source: 'plc', main: null, sub: null, receivedAt: null });
+  1065	});
+  1066	
+  1067	app.get('/api/control/status', (req, res) => {
+  1068	    res.json(controlEngine.getStatus());
+  1069	});
+  1070	
+  1071	app.post('/api/control/params', (req, res) => {
+  1072	    const { loop, kp, ki, kd, target } = req.body || {};
+  1073	    if (loop !== 'force' && loop !== 'posture') {
+  1074	        return res.status(400).json({ error: 'loop 必须是 force 或 posture' });
+  1075	    }
+  1076	    const r = controlEngine.setParams(loop, { kp, ki, kd, target });
+  1077	    if (!r.ok) return res.status(400).json({ error: r.error });
+  1078	    console.log(`🎛️ PID 参数已更新 [${loop}]`, { kp, ki, kd, target });
+  1079	    res.json({ ok: true, status: controlEngine.getStatus() });
+  1080	});
+  1081	
+  1082	app.post('/api/control/auto', (req, res) => {
+  1083	    const { loop, enabled } = req.body || {};
+  1084	    if (loop !== 'force' && loop !== 'posture') {
+  1085	        return res.status(400).json({ error: 'loop 必须是 force 或 posture' });
+  1086	    }
+  1087	    const r = controlEngine.setAuto(loop, enabled !== false);
+  1088	    if (!r.ok) return res.status(400).json({ error: r.error });
+  1089	    console.log(`🤖 自动调节 [${loop}] ${enabled !== false ? '开启' : '关闭'}`);
+  1090	    res.json({ ok: true, status: controlEngine.getStatus() });
+  1091	});
+  1092	
+  1093	app.post('/api/control/tune', (req, res) => {
+  1094	    const { loop } = req.body || {};
+  1095	    const r = controlEngine.startTune(loop);
+  1096	    if (!r.ok) return res.status(400).json({ error: r.error });
+  1097	    console.log(`📈 Z-N 阶跃整定已开始 [${loop}]，阶跃 Δu=${r.stepDelta}`);
+  1098	    res.json({ ok: true, stepDelta: r.stepDelta, status: controlEngine.getStatus() });
+  1099	});
+  1100	
+  1101	app.post('/api/control/tune/cancel', (req, res) => {
+  1102	    const r = controlEngine.cancelTune();
+  1103	    if (!r.ok) return res.status(400).json({ error: r.error });
+  1104	    console.log('🛑 Z-N 整定已取消');
+  1105	    res.json({ ok: true, status: controlEngine.getStatus() });
+  1106	});
+  1107	
+  1108	// ============================================================
+  1109	// 4. 清除模拟数据 API
+  1110	// ============================================================
+  1111	app.delete('/api/simulation/clear', async (req, res) => {
+  1112	    try {
+  1113	        const before = currentWarningList.length;
+  1114	        currentWarningList = currentWarningList.filter(w => w.code !== 'PLC_SENSOR');
+  1115	        const removed = before - currentWarningList.length;
+  1116	
+  1117	        updateOverLimitStats();
+  1118	        broadcastFullUpdate();
+  1119	        console.log(`🧹 已清除 ${removed} 条模拟告警记录`);
+  1120	        res.json({ success: true, memRemoved: removed });
+  1121	    } catch (err) {
+  1122	        console.error('❌ 清除模拟数据失败:', err);
+  1123	        res.status(500).json({ error: err.message });
+  1124	    }
+  1125	});
+  1126	
+  1127	// ============================================================
+  1128	// 5. 启动服务器
+  1129	// ============================================================
+  1130	const PORT = process.env.PORT || 3000;
+  1131	(async () => {
+  1132	    await loadHistoryFromDB();
+  1133	    server.listen(PORT, () => {
+  1134	        console.log(`✅ Server running on http://localhost:${PORT}`);
+  1135	        console.log(`📡 WebSocket 服务已启动`);
+  1136	        console.log(`📁 上传文件保存至: ${uploadDir}`);
+  1137	    });
+  1138	
+  1139	    if (SIMULATION_MODE) {
+  1140	        startSimulation();
+  1141	    } else {
+  1142	        await startRealCollection();
+  1143	    }
+  1144	
+  1145	    startControlLoop(); // 双环 PID 控制引擎（模拟/真实模式均驱动）
+  1146	})();

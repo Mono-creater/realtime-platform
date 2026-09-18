@@ -89,17 +89,18 @@ import socket from '@/socket'
 // 只保留四种受电弓告警类型（环境预警已过滤）
 const ALARM_TYPES = ['压力超限', '导高超限', '燃弧超限', '拉出值超限']
 
-// 权重字典（用于健康度计算，保留所有类型以便健康度受所有告警影响）
+// 环境类预警（温度/湿度）：由环境因素引起，不反映碳滑板自身状态，
+// 不参与健康度扣减（与后端 /api/stats/summary 口径一致）
+const ENV_ALARM_TYPES = ['高温预警', '低温预警', '高湿预警']
+
+// 权重字典（用于健康度计算，仅设备类告警参与扣分）
 const ALARM_WEIGHTS = {
   '压力超限': 10,
   '导高超限': 8,
   '燃弧超限': 5,
   '拉出值超限': 3,
-  '高温预警': 6,
-  '低温预警': 4,
   '高压报警': 10,
-  '低压报警': 6,
-  '高湿预警': 5
+  '低压报警': 6
 }
 
 const HEALTH_DECAY_FACTOR = 0.5
@@ -127,7 +128,7 @@ const MOCK_ALARMS = [
 
 // ---------- 状态 ----------
 const statCards = ref([])
-// fullWarningList 存储所有告警（用于健康度计算），但显示时过滤
+// fullWarningList 存储所有告警；健康度计算与列表显示均已过滤环境类预警
 const fullWarningList = ref([...MOCK_ALARMS])
 // 过滤后的告警列表（仅四种核心告警）
 const filteredWarningList = computed(() => {
@@ -154,9 +155,11 @@ function getTodayAlarms(list) {
 }
 
 function calculateHealth(list) {
-  if (!list || list.length === 0) return 100
+  // 环境类预警不影响碳滑板健康度，先过滤再扣分
+  const healthRelated = (list || []).filter(item => !ENV_ALARM_TYPES.includes(item.content))
+  if (healthRelated.length === 0) return 100
   let totalScore = 0
-  list.forEach(item => {
+  healthRelated.forEach(item => {
     const weight = ALARM_WEIGHTS[item.content] || DEFAULT_WEIGHT
     totalScore += weight
   })

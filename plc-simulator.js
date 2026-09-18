@@ -22,6 +22,7 @@
 // 协议与寄存器映射见 plc-packet.js 头注释。
 // ============================================================
 
+const net = require('net');
 const ModbusRTU = require('modbus-serial');
 const {
     THRESHOLDS,
@@ -229,24 +230,55 @@ function recordWrite(addr, value) {
     }
 }
 
-const server = new ModbusRTU.ServerTCP(vector, { host: HOST, port: PORT, unitID: UNIT_ID });
+function printBanner() {
+    console.log('============================================');
+    console.log('  汇川 H5U PLC 模拟器（Modbus TCP 从站）');
+    console.log(`  监听: ${HOST}:${PORT}  从站号: ${UNIT_ID}`);
+    console.log(`  采样周期: ${INTERVAL}ms  滑窗: ${WINDOW} 条`);
+    console.log(`  基准: 温度${BASE_TEMP}°C / 压力${BASE_PRESS}kPa / 湿度${BASE_HUMID}%`);
+    console.log(`  异常注入: ${ANOMALY_RAW}`);
+    console.log('  主包: 30001-30005  子包: 30011-30015  写回: 30021-30022');
+    console.log('  平台 .env 设置: PLC_MODE=real PLC_HOST=127.0.0.1 PLC_PORT=' + PORT);
+    console.log('============================================');
+    console.log('✓ 已就绪，等待平台连接（Ctrl+C 退出）');
+}
 
-console.log('============================================');
-console.log('  汇川 H5U PLC 模拟器（Modbus TCP 从站）');
-console.log(`  监听: ${HOST}:${PORT}  从站号: ${UNIT_ID}`);
-console.log(`  采样周期: ${INTERVAL}ms  滑窗: ${WINDOW} 条`);
-console.log(`  基准: 温度${BASE_TEMP}°C / 压力${BASE_PRESS}kPa / 湿度${BASE_HUMID}%`);
-console.log(`  异常注入: ${ANOMALY_RAW}`);
-console.log(`  主包: 30001-30005  子包: 30011-30015  写回: 30021-30022`);
-console.log('  平台 .env 设置: PLC_MODE=real PLC_HOST=127.0.0.1 PLC_PORT=' + PORT);
-console.log('============================================');
+function portInUseError() {
+    console.error('============================================');
+    console.error(`✗ 启动失败：端口 ${PORT} 已被占用（可能已有模拟器实例在运行）`);
+    console.error('  处理办法（任选其一）：');
+    console.error(`  1) 换端口启动：node plc-simulator.js --port ${PORT + 1}`);
+    console.error(`     同时把平台 .env 的 PLC_PORT 改为 ${PORT + 1}`);
+    console.error('  2) 清理残留进程：双击 启动PLC模拟器.bat → 选择 2（清理残留模拟器进程）');
+    console.error(`  3) 手动查看占用者：netstat -ano | findstr :${PORT}  然后 taskkill /PID <PID> /F`);
+    console.error('============================================');
+}
 
-const timer = setInterval(tick, INTERVAL);
-
-process.on('SIGINT', () => {
-    clearInterval(timer);
-    server.close(() => {
-        console.log('\n模拟器已关闭');
-        process.exit(0);
+// 启动前端口自检：避免“端口被占用却静默不监听”，导致平台连不上却看不出原因
+const probe = net.createServer();
+probe.once('error', (err) => {
+    if (err && err.code === 'EADDRINUSE') { portInUseError(); process.exit(1); }
+    console.error(`✗ 监听失败：${err && err.message ? err.message : err}`);
+    process.exit(1);
+});
+probe.once('listening', () => {
+    probe.close(() => {
+        const server = new ModbusRTU.ServerTCP(vector, { host: HOST, port: PORT, unitID: UNIT_ID });
+        if (typeof server.on === 'function') {
+            server.on('error', (err) => {
+                if (err && err.code === 'EADDRINUSE') { portInUseError(); process.exit(1); }
+                console.error(`✗ 模拟器运行错误：${err && err.message ? err.message : err}`);
+            });
+        }
+        printBanner();
+        const timer = setInterval(tick, INTERVAL);
+        process.on('SIGINT', () => {
+            clearInterval(timer);
+            server.close(() => {
+                console.log('\n模拟器已关闭');
+                process.exit(0);
+            });
+        });
     });
 });
+probe.listen(PORT, HOST);

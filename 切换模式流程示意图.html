@@ -1,0 +1,54 @@
+<html style="margin:0;padding:0;">
+<div style="background-color:transparent;box-sizing:border-box;font-family:'Roboto','PingFang SC','Segoe UI',Arial,sans-serif;color:#1A1B1C;max-width:820px;">
+  <div style="font-size:15px;font-weight:600;margin:0 0 2px;">realtime-platform：三种运行模式与切换路径</div>
+  <div style="font-size:12px;color:#6B7280;margin-bottom:14px;">示意：节点与箭头关系依据 server.js / plc-simulator.js / .env 配置整理，非精确测量图</div>
+
+  <!-- 三种模式 -->
+  <div style="display:flex;gap:10px;flex-wrap:wrap;">
+    <div style="flex:1 1 200px;min-width:0;padding:12px 12px 10px;border-radius:12px;box-sizing:border-box;background:rgba(110,115,130,0.08);border:0.5px solid rgba(0,0,0,0.08);">
+      <div style="font-size:12px;color:#6B7280;">PLC_MODE</div>
+      <div style="font-size:16px;font-weight:600;margin:2px 0 6px;">纯模拟 <span style="font-size:12px;font-weight:400;color:#6B7280;">simulation</span></div>
+      <div style="font-size:12px;line-height:1.6;color:#3A3C40;">数据：server.js 自生成随机数，30% 概率注入异常<br/>闭环：内部植物模型（假闭环）<br/>数据库：跳过，告警只存内存<br/>页面标签：模拟数据</div>
+    </div>
+    <div style="flex:1 1 200px;min-width:0;padding:12px 12px 10px;border-radius:12px;box-sizing:border-box;background:rgba(155,187,244,0.14);border:0.5px solid rgba(0,0,0,0.08);">
+      <div style="font-size:12px;color:#4A5A78;">PLC_MODE=real + 127.0.0.1:1502</div>
+      <div style="font-size:16px;font-weight:600;margin:2px 0 6px;">模拟器闭环 <span style="font-size:12px;font-weight:400;color:#6B7280;">推荐中间站</span></div>
+      <div style="font-size:12px;line-height:1.6;color:#3A3C40;">数据：plc-simulator.js（Modbus TCP 从站，忠实模拟 H5U 固件）<br/>闭环：真实 Modbus（FC16 写 30021/30022）<br/>数据库：会加载 Prisma<br/>页面标签：PLC 实时数据</div>
+    </div>
+    <div style="flex:1 1 200px;min-width:0;padding:12px 12px 10px;border-radius:12px;box-sizing:border-box;background:rgba(148,216,195,0.16);border:0.5px solid rgba(0,0,0,0.08);">
+      <div style="font-size:12px;color:#3E6B5A;">PLC_MODE=real + 192.168.1.88:502</div>
+      <div style="font-size:16px;font-weight:600;margin:2px 0 6px;">真实 PLC <span style="font-size:12px;font-weight:400;color:#6B7280;">现场 H5U</span></div>
+      <div style="font-size:12px;line-height:1.6;color:#3A3C40;">数据：现场汇川 H5U（主包 30001/2001 段 + 异常子包）<br/>闭环：真实 Modbus（FC16 写回）<br/>数据库：会加载 Prisma（需 DATABASE_URL）<br/>页面标签：PLC 实时数据</div>
+    </div>
+  </div>
+
+  <!-- 切换路径 -->
+  <div style="margin-top:14px;padding:10px 12px;border-radius:12px;background:rgba(0,0,0,0.025);border:0.5px solid rgba(0,0,0,0.08);box-sizing:border-box;">
+    <div style="font-size:13px;font-weight:600;margin-bottom:8px;">切换路径</div>
+    <div style="display:flex;gap:10px;flex-wrap:wrap;">
+      <div style="flex:1 1 220px;min-width:0;padding:10px;border-radius:10px;box-sizing:border-box;background:#FFFFFF;border:0.5px solid rgba(0,0,0,0.08);">
+        <div style="font-size:12px;font-weight:600;">⇄ .env 永久切换（推荐）</div>
+        <div style="font-size:12px;color:#6B7280;line-height:1.6;margin-top:4px;">改 PLC_MODE / PLC_HOST / PLC_PORT / PLC_REG_* → <b>重启 server</b>。模拟器闭环 → 真实 PLC 只需改两个地址。</div>
+      </div>
+      <div style="flex:1 1 220px;min-width:0;padding:10px;border-radius:10px;box-sizing:border-box;background:#FFFFFF;border:0.5px solid rgba(0,0,0,0.08);">
+        <div style="font-size:12px;font-weight:600;">⇄ 运行时临时切换</div>
+        <div style="font-size:12px;color:#6B7280;line-height:1.6;margin-top:4px;">POST /api/plc/mode 或页面按钮，无需重启；但<b>重启后回到 .env 原值</b>，且不重新读取 .env。</div>
+      </div>
+      <div style="flex:1 1 220px;min-width:0;padding:10px;border-radius:10px;box-sizing:border-box;background:rgba(250,173,20,0.10);border:0.5px solid rgba(0,0,0,0.08);">
+        <div style="font-size:12px;font-weight:600;">← 自动回退（切 real 连不上时）</div>
+        <div style="font-size:12px;color:#6B7280;line-height:1.6;margin-top:4px;">connectPLC 失败 → 自动退回纯模拟，且<b>不会自动重试</b>；修好 PLC 后需再切一次或重启。</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- 关键事实 -->
+  <div style="margin-top:12px;padding:10px 12px;border-radius:12px;background:rgba(155,187,244,0.10);border:0.5px solid rgba(0,0,0,0.08);box-sizing:border-box;">
+    <div style="font-size:13px;font-weight:600;margin-bottom:6px;">三个必须记住的行为</div>
+    <div style="font-size:12px;color:#3A3C40;line-height:1.7;">
+      ① 数据库只在<b>启动时</b>按初始 PLC_MODE 加载：启动为 simulation 时，运行中切 real 也不会落库，要落库必须 real 启动 + DATABASE_URL。<br/>
+      ② 寄存器段必须与 PLC 程序一致（标准型 30001 段 / Easy 型 D2001 段），否则数据全 0 或错位。<br/>
+      ③ 切真实模式前建议先走<b>模拟器闭环</b>验证整条链路（采集→告警→写回→整定），再指向真机。
+    </div>
+  </div>
+</div>
+</html>

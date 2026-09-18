@@ -44,9 +44,9 @@
         <el-table-column prop="content" label="预警内容" min-width="100" align="center" />
         <el-table-column prop="time" label="预警时间" min-width="110" align="center" />
         <el-table-column prop="worker" label="维修人工号" min-width="110" align="center" />
-        <el-table-column prop="remark" label="备注" min-width="80" align="center">
+        <el-table-column prop="remark" label="备注" min-width="200" align="center">
           <template #default="{ row }">
-            {{ row.remark === '/' ? '—' : row.remark }}
+            {{ displayRemark(row) }}
           </template>
         </el-table-column>
         <el-table-column label="操作" width="110" align="center" fixed="right">
@@ -94,6 +94,25 @@ const selectedRowId = ref(null)
 const selectedRows = ref([])
 function handleSelectionChange(rows) {
   selectedRows.value = rows
+}
+
+// ---------- 环境类预警成因说明 ----------
+// 与后端口径一致：高温/低温/高湿属环境因素，非碳滑板部件故障。
+// 历史数据的备注可能为空、'/' 或 JSON 调试串，展示时兜底为成因说明
+const ENV_FAULT_CAUSES = {
+  '高温预警': '环境温度过高所致，属环境因素，非碳滑板部件故障；建议检查环境散热与空调',
+  '低温预警': '环境温度过低所致，属环境因素，非碳滑板部件故障；低温下碳条变脆，建议关注取流状态',
+  '高湿预警': '环境湿度过高所致，属环境因素，非碳滑板部件故障；高湿易加剧燃弧，建议加强除湿通风'
+}
+function displayRemark(row) {
+  const remark = row.remark || '/'
+  if (ENV_FAULT_CAUSES[row.content]) {
+    if (remark === '/' || remark.startsWith('{')) {
+      return ENV_FAULT_CAUSES[row.content]
+    }
+    return remark
+  }
+  return remark === '/' ? '—' : remark
 }
 
 // ---------- 过滤 ----------

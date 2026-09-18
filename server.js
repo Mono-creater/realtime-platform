@@ -139,6 +139,25 @@ async function loadHistoryFromDB() {
   }
 }
 
+// ---------- 环境类预警口径（温度/湿度） ----------
+// 高温/低温/高湿由环境因素引起，不反映碳滑板自身状态：
+// 1. 不计入碳滑板健康度扣分（/api/stats/summary 与前端 MonitorGlobal 保持同一口径）
+// 2. 在故障总览与 PDF 报告的备注中写明具体成因，便于与环境预警和设备故障区分
+const ENV_WARNING_CONTENTS = ['高温预警', '低温预警', '高湿预警'];
+const ENV_WARNING_CAUSES = {
+    '高温预警': '环境温度过高所致，属环境因素，非碳滑板部件故障；建议检查环境散热与空调',
+    '低温预警': '环境温度过低所致，属环境因素，非碳滑板部件故障；低温下碳条变脆，建议关注取流状态',
+    '高湿预警': '环境湿度过高所致，属环境因素，非碳滑板部件故障；高湿易加剧燃弧，建议加强除湿通风'
+};
+// 备注取值：环境类预警的历史数据可能是空、'/' 或 JSON 调试串，统一兜底为成因说明
+function resolveEnvRemark(content, remark) {
+    if (!ENV_WARNING_CONTENTS.includes(content)) return remark || '/';
+    if (!remark || remark === '/' || remark.startsWith('{')) {
+        return ENV_WARNING_CAUSES[content];
+    }
+    return remark;
+}
+
 async function saveWarningToHistory(warning) {
   if (!prisma) {
     console.log('💾 模拟模式：保存警告到内存（不持久化）', warning);
@@ -174,7 +193,7 @@ io.on('connection', (socket) => {
         content: newWarning.content,
         time: newWarning.time,
         worker: newWarning.worker || '',
-        remark: newWarning.remark || '/',
+        remark: resolveEnvRemark(newWarning.content, newWarning.remark),
       };
       pushWarning(memWarning);
       updateOverLimitStats();
@@ -206,20 +225,27 @@ app.get('/api/test', async (req, res) => {
 app.get('/api/stats/summary', async (req, res) => {
   try {
     let todayCount;
+    let healthCount;
     if (prisma) {
       const today = new Date().toISOString().slice(0,10);
-      todayCount = await prisma.warningHistory.count({
-        where: { time: { gte: new Date(today), lt: new Date(today + 'T23:59:59') } }
+      const timeRange = { gte: new Date(today), lt: new Date(today + 'T23:59:59') };
+      todayCount = await prisma.warningHistory.count({ where: { time: timeRange } });
+      // 碳滑板健康度只统计设备类告警，环境类预警不扣减
+      healthCount = await prisma.warningHistory.count({
+        where: { time: timeRange, content: { notIn: ENV_WARNING_CONTENTS } }
       });
     } else {
       const today = new Date().toISOString().slice(0,10);
       todayCount = currentWarningList.filter(item => item.time && item.time.startsWith(today)).length;
+      healthCount = currentWarningList.filter(item =>
+        item.time && item.time.startsWith(today) && !ENV_WARNING_CONTENTS.includes(item.content)
+      ).length;
     }
     let health;
-    if (todayCount === 0) {
+    if (healthCount === 0) {
       health = 100;
     } else {
-      health = Math.round(100 - todayCount * 0.5);
+      health = Math.round(100 - healthCount * 0.5);
       health = Math.min(100, Math.max(0, health));
     }
     res.json({
@@ -339,7 +365,8 @@ app.post('/api/alert', async (req, res) => {
       content: alarmType || '未知告警',
       time,
       worker: worker || 'SYSTEM',
-      remark: imageUrl || '',
+      // 环境类预警备注写明具体成因，其余告警仍记录图片地址
+      remark: ENV_WARNING_CAUSES[alarmType] || (imageUrl || ''),
       level: level || '--',
       value: value || 0,
       carNumber: carNumber || '--',
@@ -603,7 +630,7 @@ app.get('/api/export/pdf/:id', async (req, res) => {
             ...(warning.location ? [['位置', warning.location]] : []),
             ...(warning.mileage ? [['里程', warning.mileage]] : []),
             ...(warning.speed !== undefined && warning.speed !== null ? [['速度', String(warning.speed)]] : []),
-            ['备注', warning.remark || '/'],
+            ['备注', resolveEnvRemark(warning.content, warning.remark)],
         ];
 
         let y = 130;
@@ -739,11 +766,14 @@ async function handleAlarm(faults, avg) {
             content: fault.type,
             time: new Date().toISOString(),
             worker: 'PLC_AUTO',
-            remark: JSON.stringify({
-                avg: avg,
-                faults: faults,
-                timestamp: new Date().toISOString()
-            })
+            // 环境类预警备注写明具体成因（含触发数据），其余类型保留调试 JSON
+            remark: ENV_WARNING_CAUSES[fault.type]
+                ? `${ENV_WARNING_CAUSES[fault.type]}；触发数据：${fault.detail}`
+                : JSON.stringify({
+                    avg: avg,
+                    faults: faults,
+                    timestamp: new Date().toISOString()
+                })
         };
         const created = await saveWarningToHistory(warning);
         const memWarning = {

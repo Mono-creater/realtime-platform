@@ -1,0 +1,166 @@
+{
+  "pass": 36,
+  "fail": 0,
+  "generatedAt": "2026-09-17T12:09:31.726Z",
+  "results": {
+    "standards": {
+      "Fm_0": 70,
+      "Fm_80": 76.208,
+      "Fm_160": 94.83,
+      "Fm_250": 130.625,
+      "DC_80": 79.92,
+      "limits": {
+        "sigmaMax": 28.449599999999997,
+        "fMax": 180.18079999999998,
+        "fMin": 9.48320000000001
+      }
+    },
+    "controlForce": {
+      "zn": {
+        "kp": 2.0454383051940903,
+        "ti": 2.0156,
+        "td": 0.5039,
+        "ki": 1.0148036838629144,
+        "kd": 1.0306963619873022,
+        "method": "ZN"
+      },
+      "safe": {
+        "reduce": 0.6284471316914909,
+        "kp": 1.2854498359511304,
+        "ki": 0.637750464353607,
+        "kd": 0.6477381723357747,
+        "method": "ZN-折减"
+      },
+      "preset": {
+        "derivFilterN": 8,
+        "integralSeparation": 0.35,
+        "rampRate": 3
+      },
+      "conservative": {
+        "riseS": 1,
+        "overshootPct": 15.7,
+        "settleS": 12.5,
+        "sse": 0,
+        "uMin": 81,
+        "uMax": 130.7
+      },
+      "znBase": {
+        "riseS": 0.5,
+        "overshootPct": 83.94,
+        "settleS": 100,
+        "sse": -7.716,
+        "uMin": 50,
+        "uMax": 167.5
+      },
+      "v2Safe": {
+        "riseS": 8,
+        "overshootPct": 3.68,
+        "settleS": 15.5,
+        "sse": 0,
+        "uMin": 72.3,
+        "uMax": 104.2
+      }
+    },
+    "controlPosture": {
+      "safe": {
+        "ok": true,
+        "kp": 0.45454545454545453,
+        "ti": 0.5,
+        "td": 0,
+        "ki": 0.9090909090909091,
+        "kd": 0,
+        "lambda": 0.5,
+        "method": "IMC",
+        "reason": "T=0.5s ≤ L=0.6s：Z-N 开环整定不适用，改用 IMC-PI（λ=T）"
+      },
+      "preset": {
+        "derivFilterN": 8,
+        "integralSeparation": 0.35,
+        "rampRate": 100
+      },
+      "imcMetrics": {
+        "riseS": 5,
+        "overshootPct": 3.66,
+        "settleS": 8.5,
+        "sse": 0,
+        "uMin": 1822.7,
+        "uMax": 2421.9
+      }
+    },
+    "alarm": {
+      "spikeFalseAlarm": {
+        "legacy": 1,
+        "v2": 0
+      },
+      "stepLatencyMs": {
+        "legacy": 0,
+        "v2": 1000
+      },
+      "rampLatencyMs": {
+        "legacy": 401000,
+        "v2": 2000
+      }
+    },
+    "link": {
+      "stats": {
+        "packets": 100,
+        "gaps": 3,
+        "expected": 103,
+        "lossRate": 0.0291,
+        "lastSeq": 203,
+        "lastPacketAt": 99000,
+        "quality": "GOOD",
+        "failures": 0,
+        "backoffStep": 0
+      },
+      "backoff": [
+        501,
+        1082,
+        1992
+      ],
+      "writeVerify": {
+        "ok": {
+          "reg": 30021,
+          "value": 100,
+          "readback": 100,
+          "attempts": 1,
+          "ok": true
+        },
+        "bad": {
+          "ok": false,
+          "attempts": 3
+        }
+      }
+    },
+    "maintenance": {
+      "mttr": 1,
+      "health": {
+        "normal": {
+          "score": 98,
+          "grade": "正常",
+          "advice": "按周期巡检，保持常规监测",
+          "penalties": {
+            "force": 0,
+            "wave": 1.6,
+            "temp": 0,
+            "alarm": 0
+          },
+          "note": "代理指标：无滑板厚度直接测量时使用，投运前应按线路数据标定"
+        },
+        "abnormal": {
+          "score": 24,
+          "grade": "立即检修",
+          "advice": "触发紧急工单，停运检查碳滑板与受电弓状态",
+          "penalties": {
+            "force": 15,
+            "wave": 16,
+            "temp": 20,
+            "alarm": 25
+          },
+          "note": "代理指标：无滑板厚度直接测量时使用，投运前应按线路数据标定"
+        }
+      },
+      "auditEntries": 5
+    }
+  }
+}
